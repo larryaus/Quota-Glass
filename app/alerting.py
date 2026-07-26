@@ -128,13 +128,24 @@ class AlertEngine:
 
     def _notify_event(self, event: Dict[str, Any]) -> None:
         event_type = str(event["event_type"])
-        provider = str(event["provider"]).title()
+        provider_key = str(event["provider"])
+        provider = {
+            "chatgpt": "ChatGPT",
+            "claude": "Claude",
+        }.get(provider_key.lower(), provider_key.title())
         label = str(event["label"])
         if event_type == "REFRESHED":
+            used_pct = event["used_pct"]
+            message = "%s usage is available again." % provider
+            if used_pct is not None and float(used_pct) == 0.0:
+                message = (
+                    "%s usage reset to 0%% and is available again."
+                    % provider
+                )
             self.notifier.notify(
                 "Quota refreshed",
                 label,
-                "%s usage is available again." % provider,
+                message,
             )
             return
         used_pct = event["used_pct"]

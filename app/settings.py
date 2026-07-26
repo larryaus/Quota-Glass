@@ -51,6 +51,15 @@ class Settings:
         chatgpt_live_min_interval_seconds: Optional[int] = None,
         codex_cli_path: Optional[str] = None,
         codex_cli_timeout_seconds: Optional[int] = None,
+        email_notifications_enabled: Optional[bool] = None,
+        email_to: Optional[str] = None,
+        email_from: Optional[str] = None,
+        smtp_host: Optional[str] = None,
+        smtp_port: Optional[int] = None,
+        smtp_username: Optional[str] = None,
+        smtp_password: Optional[str] = None,
+        smtp_security: Optional[str] = None,
+        smtp_timeout_seconds: Optional[int] = None,
     ) -> None:
         home = Path.home()
         self.enable_claude_oauth = (
@@ -151,4 +160,52 @@ class Settings:
             _int_env("CODEX_CLI_TIMEOUT_SECONDS", 20)
             if codex_cli_timeout_seconds is None
             else codex_cli_timeout_seconds,
+        )
+        self.email_notifications_enabled = (
+            _bool_env("EMAIL_NOTIFICATIONS_ENABLED", False)
+            if email_notifications_enabled is None
+            else email_notifications_enabled
+        )
+        self.email_to = (
+            os.getenv("EMAIL_TO", "")
+            if email_to is None
+            else email_to
+        )
+        self.smtp_username = (
+            os.getenv("SMTP_USERNAME", "")
+            if smtp_username is None
+            else smtp_username
+        )
+        self.smtp_password = (
+            os.getenv("SMTP_PASSWORD", "")
+            if smtp_password is None
+            else smtp_password
+        )
+        self.email_from = (
+            os.getenv("EMAIL_FROM", "") or self.smtp_username
+            if email_from is None
+            else email_from
+        )
+        self.smtp_host = (
+            os.getenv("SMTP_HOST", "")
+            if smtp_host is None
+            else smtp_host
+        )
+        self.smtp_security = (
+            os.getenv("SMTP_SECURITY", "starttls")
+            if smtp_security is None
+            else smtp_security
+        ).strip().lower()
+        default_smtp_port = 465 if self.smtp_security == "ssl" else 587
+        self.smtp_port = max(
+            1,
+            _int_env("SMTP_PORT", default_smtp_port)
+            if smtp_port is None
+            else smtp_port,
+        )
+        self.smtp_timeout_seconds = max(
+            1,
+            _int_env("SMTP_TIMEOUT_SECONDS", 10)
+            if smtp_timeout_seconds is None
+            else smtp_timeout_seconds,
         )

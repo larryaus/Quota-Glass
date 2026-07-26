@@ -1,15 +1,45 @@
 import asyncio
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, List, Optional
 
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.alerting import AlertEngine
 from app.database import Database
-from app.notifier import MacOSNotifier, Notifier, NullNotifier
+from app.notifier import (
+    CompositeNotifier,
+    MacOSNotifier,
+    Notifier,
+    NullNotifier,
+    SmtpEmailNotifier,
+)
 from app.poller import UsagePoller
 from app.settings import Settings
+
+
+def configured_notifier(settings: Settings) -> Notifier:
+    notifiers: List[Notifier] = []
+    if settings.notifications_enabled:
+        notifiers.append(MacOSNotifier())
+    if settings.email_notifications_enabled:
+        notifiers.append(
+            SmtpEmailNotifier(
+                host=settings.smtp_host,
+                port=settings.smtp_port,
+                sender=settings.email_from,
+                recipients=settings.email_to,
+                username=settings.smtp_username,
+                password=settings.smtp_password,
+                security=settings.smtp_security,
+                timeout_seconds=settings.smtp_timeout_seconds,
+            )
+        )
+    if not notifiers:
+        return NullNotifier()
+    if len(notifiers) == 1:
+        return notifiers[0]
+    return CompositeNotifier(notifiers)
 
 
 def create_app(
@@ -20,9 +50,7 @@ def create_app(
     database = Database(configured.database_path)
     selected_notifier = notifier
     if selected_notifier is None:
-        selected_notifier = (
-            MacOSNotifier() if configured.notifications_enabled else NullNotifier()
-        )
+        selected_notifier = configured_notifier(configured)
     alert_engine = AlertEngine(
         database,
         selected_notifier,
