@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 import pytest
@@ -246,3 +247,137 @@ async def test_chatgpt_keeps_polling_while_claude_oauth_is_cached(
     assert len(chatgpt_calls) == 2
     assert len(keychain_reads) == 1
     assert oauth_calls == ["token"]
+
+
+@pytest.mark.asyncio
+async def test_poller_passes_live_settings_to_chatgpt(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_chatgpt(*args, **kwargs):
+        captured.update(kwargs)
+        return ProviderState(key="chatgpt", label="ChatGPT", mode="local")
+
+    async def working_claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", fake_chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", working_claude)
+    settings = poller_settings(
+        tmp_path,
+        enable_chatgpt_live=True,
+        codex_cli_path="/fake/codex",
+        codex_cli_timeout_seconds=9,
+    )
+    database = Database(settings.database_path)
+    alerts = AlertEngine(database, NullNotifier())
+    poller = UsagePoller(settings, database, alerts)
+
+    await poller.refresh()
+
+    assert captured["enable_live"] is True
+    assert captured["cli_path"] == "/fake/codex"
+    assert captured["cli_timeout_seconds"] == 9
+    assert captured["live_cache"] is poller._chatgpt_live_cache
+
+
+@pytest.mark.asyncio
+async def test_concurrent_refresh_returns_current_state_instead_of_queueing(
+    monkeypatch,
+    tmp_path,
+):
+    """Waiting for the refresh lock must never occupy a worker thread.
+
+    The lock holder needs workers of its own for parse_chatgpt, alerting, and
+    sample persistence, and the ChatGPT live source can hold it for ~25s (a 20s
+    CLI deadline plus subprocess termination). Callers parked on the lock can
+    therefore starve the holder, which then never releases it and never
+    recovers. A refresh that arrives mid-poll returns the current state.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def blocking_chatgpt(*args, **kwargs):
+        calls.append(True)
+        entered.set()
+        release.wait(30)
+        return ProviderState(
+            key="chatgpt",
+            label="ChatGPT",
+            mode="local",
+            meters=[quota_meter("chatgpt", 42)],
+        )
+
+    async def claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", blocking_chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", claude)
+    settings = poller_settings(tmp_path)
+    database = Database(settings.database_path)
+    poller = UsagePoller(settings, database, AlertEngine(database, NullNotifier()))
+
+    in_flight = asyncio.create_task(poller.refresh())
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(0.005)
+        state = await asyncio.wait_for(poller.refresh(), timeout=5)
+    finally:
+        release.set()
+    await in_flight
+
+    assert len(calls) == 1, "a concurrent refresh must not queue behind the poll"
+    assert state.poller is poller.health
+    assert poller._refresh_lock.acquire(blocking=False), "lock was left held"
+    poller._refresh_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_refresh_releases_the_lock_when_it_raises(monkeypatch, tmp_path):
+    def chatgpt(*args, **kwargs):
+        return ProviderState(key="chatgpt", label="ChatGPT", mode="local")
+
+    async def claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    def boom():
+        raise RuntimeError("state building failed")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", claude)
+    settings = poller_settings(tmp_path)
+    database = Database(settings.database_path)
+    poller = UsagePoller(settings, database, AlertEngine(database, NullNotifier()))
+    monkeypatch.setattr(poller, "state", boom)
+
+    with pytest.raises(RuntimeError):
+        await poller.refresh()
+
+    assert poller._refresh_lock.acquire(blocking=False), (
+        "a failed refresh must not leave the poller locked out forever"
+    )
+    poller._refresh_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_live_cache_survives_across_polls(monkeypatch, tmp_path):
+    seen = []
+
+    def fake_chatgpt(*args, **kwargs):
+        seen.append(kwargs["live_cache"])
+        return ProviderState(key="chatgpt", label="ChatGPT", mode="local")
+
+    async def working_claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", fake_chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", working_claude)
+    settings = poller_settings(tmp_path, enable_chatgpt_live=True)
+    database = Database(settings.database_path)
+    alerts = AlertEngine(database, NullNotifier())
+    poller = UsagePoller(settings, database, alerts)
+
+    await poller.refresh()
+    await poller.refresh()
+
+    assert seen[0] is seen[1], "cache must persist so backoff state is not lost"

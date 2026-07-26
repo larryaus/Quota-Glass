@@ -406,6 +406,319 @@ def test_chatgpt_rollout_usage_files_are_opened_once(tmp_path, monkeypatch):
     assert usage_opens == [path]
 
 
+def test_chatgpt_live_meters_use_rollout_meter_keys(tmp_path, fixture_dir):
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.live_cache import LiveSourceCache
+
+    with (fixture_dir / "chatgpt" / "account-rate-limits.json").open() as handle:
+        payload = json.load(handle)
+
+    def fake_reader(cli_path, timeout_seconds):
+        return payload
+
+    state = parse_chatgpt(
+        tmp_path,
+        enable_live=True,
+        live_cache=LiveSourceCache("Codex CLI"),
+        live_reader=fake_reader,
+    )
+
+    assert state.mode == "oauth"
+    assert state.plan_type == "plus"
+    assert state.error is None
+    assert state.oauth_backed_off is False
+    keys = [meter.key for meter in state.meters]
+    assert keys == ["chatgpt.primary"]
+    meter = state.meters[0]
+    assert meter.used_pct == 18
+    assert meter.window_minutes == 10080
+    assert meter.resets_at == 1785621948
+    assert meter.source == "app-server"
+    assert meter.stale is False
+
+
+def test_chatgpt_falls_back_to_rollout_when_live_fails(tmp_path, fixture_dir):
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.codex_cli import CodexCliUnavailable
+    from app.providers.live_cache import LiveSourceCache
+
+    sessions = tmp_path / "2026" / "07" / "25"
+    sessions.mkdir(parents=True)
+    source = fixture_dir / "chatgpt" / "2026" / "07" / "25" / "rollout-example.jsonl"
+    (sessions / "rollout-example.jsonl").write_text(source.read_text())
+
+    def failing_reader(cli_path, timeout_seconds):
+        raise CodexCliUnavailable("codex is not logged in")
+
+    state = parse_chatgpt(
+        tmp_path,
+        enable_live=True,
+        live_cache=LiveSourceCache("Codex CLI"),
+        live_reader=failing_reader,
+    )
+
+    assert state.mode == "local"
+    assert state.meters, "rollout meters must still render when live fails"
+    assert state.meters[0].source == "rollout"
+    # The user has already enabled the live source, so the card must show the
+    # backoff banner rather than the note asking them to enable it.
+    assert state.oauth_backed_off is True
+    assert state.oauth_backoff_reason is not None
+    assert "not logged in" in state.oauth_backoff_reason
+    assert state.oauth_next_retry_at is not None
+    assert state.error is not None
+    assert "not logged in" in state.error
+
+
+def test_chatgpt_live_failure_keeps_the_rollout_error_visible(tmp_path):
+    """A live failure annotates the rollout state; it must not erase it."""
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.codex_cli import CodexCliUnavailable
+    from app.providers.live_cache import LiveSourceCache
+
+    def failing_reader(cli_path, timeout_seconds):
+        raise CodexCliUnavailable("codex is not installed")
+
+    state = parse_chatgpt(
+        tmp_path,
+        enable_live=True,
+        live_cache=LiveSourceCache("Codex CLI"),
+        live_reader=failing_reader,
+    )
+
+    assert state.mode == "local"
+    assert state.meters == []
+    assert "No Codex session usage snapshots found." in state.error
+    assert "codex is not installed" in state.error
+    assert state.oauth_backed_off is True
+
+
+def test_chatgpt_serves_cached_live_reading_during_backoff(tmp_path, fixture_dir):
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.codex_cli import CodexCliTimeout
+    from app.providers.live_cache import LiveSourceCache
+
+    with (fixture_dir / "chatgpt" / "account-rate-limits.json").open() as handle:
+        payload = json.load(handle)
+    cache = LiveSourceCache("Codex CLI", min_interval_seconds=0)
+    # LiveSourceCache clamps min_interval_seconds to at least 1 (see
+    # app/providers/live_cache.py), so the second attempt must land at least
+    # a full second after the first for `should_attempt` to fire again.
+    # Explicit `now` values keep that gap deterministic instead of depending
+    # on how fast these two calls happen to execute back-to-back.
+    first_call = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+    second_call = datetime(2026, 7, 26, 12, 0, 5, tzinfo=timezone.utc)
+
+    parse_chatgpt(
+        tmp_path,
+        now=first_call,
+        enable_live=True,
+        live_cache=cache,
+        live_reader=lambda cli_path, timeout_seconds: payload,
+    )
+
+    def failing_reader(cli_path, timeout_seconds):
+        raise CodexCliTimeout("codex app-server hung")
+
+    state = parse_chatgpt(
+        tmp_path,
+        now=second_call,
+        enable_live=True,
+        live_cache=cache,
+        live_reader=failing_reader,
+    )
+
+    assert state.mode == "oauth"
+    assert state.oauth_backed_off is True
+    assert "hung" in state.oauth_backoff_reason
+    assert state.meters[0].used_pct == 18
+    assert state.oauth_cache_age_seconds == 5
+    # A frozen reading must not be alerted on, sampled, or drawn as live data.
+    assert state.meters[0].stale is True, (
+        "a cached reading served during backoff is not a fresh reading"
+    )
+    assert state.error is not None
+    assert "cached" in state.error
+    assert "hung" in state.error
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_chatgpt_non_finite_percentage_is_dropped(tmp_path, literal):
+    """json.loads accepts bare NaN and Infinity from either source.
+
+    max(0.0, min(100.0, nan)) is exactly 100.0, which meets the default
+    ALERT_THRESHOLD_PCT and fires a bogus "quota exhausted" notification, so a
+    non-finite reading must become no reading at all (AlertEngine skips
+    used_pct=None).
+    """
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.live_cache import LiveSourceCache
+
+    live_payload = json.loads(
+        '{"rateLimits": {"primary": {"usedPercent": %s,'
+        ' "windowDurationMins": 300, "resetsAt": 1785621948}}}' % literal
+    )
+    live = parse_chatgpt(
+        tmp_path,
+        enable_live=True,
+        live_cache=LiveSourceCache("Codex CLI"),
+        live_reader=lambda cli_path, timeout_seconds: live_payload,
+    )
+
+    assert live.mode == "oauth"
+    assert [meter.key for meter in live.meters] == ["chatgpt.primary"]
+    assert live.meters[0].used_pct is None
+
+    snapshot = tmp_path / "2026" / "07" / "26" / "rollout-nonfinite.jsonl"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text(
+        json.dumps(_token_record("2026-07-26T11:59:00Z", float(literal)))
+        + "\n",
+        encoding="utf-8",
+    )
+    rollout = parse_chatgpt(
+        tmp_path,
+        now=datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert rollout.mode == "local"
+    assert [meter.key for meter in rollout.meters] == ["chatgpt.primary"]
+    assert rollout.meters[0].used_pct is None
+
+
+def test_chatgpt_live_disabled_keeps_local_mode(tmp_path, fixture_dir):
+    from app.providers.chatgpt import parse_chatgpt
+
+    sessions = tmp_path / "2026" / "07" / "25"
+    sessions.mkdir(parents=True)
+    source = fixture_dir / "chatgpt" / "2026" / "07" / "25" / "rollout-example.jsonl"
+    (sessions / "rollout-example.jsonl").write_text(source.read_text())
+
+    def exploding_reader(cli_path, timeout_seconds):
+        raise AssertionError("live reader must not run when disabled")
+
+    state = parse_chatgpt(tmp_path, live_reader=exploding_reader)
+
+    assert state.mode == "local"
+    assert state.meters[0].source == "rollout"
+
+
+def test_chatgpt_falls_back_to_rollout_when_live_payload_is_not_a_dict(
+    tmp_path, fixture_dir
+):
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.live_cache import LiveSourceCache
+
+    sessions = tmp_path / "2026" / "07" / "25"
+    sessions.mkdir(parents=True)
+    source = fixture_dir / "chatgpt" / "2026" / "07" / "25" / "rollout-example.jsonl"
+    (sessions / "rollout-example.jsonl").write_text(source.read_text())
+
+    def malformed_reader(cli_path, timeout_seconds):
+        return ["not", "a", "dict"]
+
+    state = parse_chatgpt(
+        tmp_path,
+        enable_live=True,
+        live_cache=LiveSourceCache("Codex CLI"),
+        live_reader=malformed_reader,
+    )
+
+    assert state.mode == "local"
+    assert state.meters, "rollout meters must still render when the live payload is malformed"
+    assert state.meters[0].source == "rollout"
+
+
+def test_chatgpt_falls_back_when_live_payload_has_no_known_windows(
+    tmp_path, fixture_dir
+):
+    """A renamed window key is a protocol change, not a usable reading.
+
+    Serving it as a successful live response would leave the card emptier than
+    rollout-only mode, and caching it would suppress retries for the whole
+    minimum interval.
+    """
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.live_cache import LiveSourceCache
+
+    sessions = tmp_path / "2026" / "07" / "25"
+    sessions.mkdir(parents=True)
+    source = fixture_dir / "chatgpt" / "2026" / "07" / "25" / "rollout-example.jsonl"
+    (sessions / "rollout-example.jsonl").write_text(source.read_text())
+
+    drifted = {
+        "rateLimits": {
+            "primaryLimit": {
+                "usedPercent": 18,
+                "windowDurationMins": 10080,
+                "resetsAt": 1785621948,
+            },
+            "planType": "plus",
+        }
+    }
+    cache = LiveSourceCache("Codex CLI")
+
+    state = parse_chatgpt(
+        tmp_path,
+        enable_live=True,
+        live_cache=cache,
+        live_reader=lambda cli_path, timeout_seconds: drifted,
+    )
+
+    assert state.mode == "local"
+    assert [meter.key for meter in state.meters] == ["chatgpt.primary"]
+    assert state.meters[0].source == "rollout"
+    assert state.meters[0].used_pct == 87.5
+    assert cache.payload is None, "an unusable live payload must not be cached"
+    assert cache.backoff_reason is not None
+    assert "quota window" in cache.backoff_reason
+    assert "snapshot" not in cache.backoff_reason, (
+        "the live path must not borrow the rollout path's wording"
+    )
+
+
+def test_chatgpt_does_not_serve_a_cached_payload_without_known_windows(
+    tmp_path, fixture_dir
+):
+    """A later live failure must not resurrect an unusable cached payload."""
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.codex_cli import CodexCliTimeout
+    from app.providers.live_cache import LiveSourceCache
+
+    sessions = tmp_path / "2026" / "07" / "25"
+    sessions.mkdir(parents=True)
+    source = fixture_dir / "chatgpt" / "2026" / "07" / "25" / "rollout-example.jsonl"
+    (sessions / "rollout-example.jsonl").write_text(source.read_text())
+
+    drifted = {"rateLimits": {"primaryLimit": {"usedPercent": 18}}}
+    cache = LiveSourceCache("Codex CLI", min_interval_seconds=1)
+    first_call = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+    second_call = datetime(2026, 7, 26, 12, 0, 30, tzinfo=timezone.utc)
+
+    parse_chatgpt(
+        tmp_path,
+        now=first_call,
+        enable_live=True,
+        live_cache=cache,
+        live_reader=lambda cli_path, timeout_seconds: drifted,
+    )
+
+    def failing_reader(cli_path, timeout_seconds):
+        raise CodexCliTimeout("codex app-server hung")
+
+    state = parse_chatgpt(
+        tmp_path,
+        now=second_call,
+        enable_live=True,
+        live_cache=cache,
+        live_reader=failing_reader,
+    )
+
+    assert state.mode == "local"
+    assert [meter.key for meter in state.meters] == ["chatgpt.primary"]
+    assert state.meters[0].source == "rollout"
+
+
 def test_claude_local_parser_aggregates_windows_and_cost(fixture_dir):
     state = parse_claude_local(
         fixture_dir / "claude",
@@ -785,3 +1098,43 @@ async def test_claude_oauth_still_polls_when_local_parser_fails(
 
     assert state.mode == "oauth"
     assert state.meters[0].used_pct == 75
+
+
+def test_latest_snapshot_skips_files_without_rate_limits(tmp_path):
+    from app.providers.chatgpt import _latest_snapshot
+
+    sessions = tmp_path / "sessions" / "2026" / "07" / "26"
+    sessions.mkdir(parents=True)
+
+    def write(name, mtime, with_limits):
+        path = sessions / ("rollout-%s.jsonl" % name)
+        records = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-26T04:00:00Z",
+                "payload": {"type": "agent_message", "message": "x"},
+            }
+        ]
+        if with_limits:
+            records.append(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-07-26T00:00:00Z",
+                    "payload": {
+                        "type": "token_count",
+                        "rate_limits": {"primary": {"used_percent": 42}},
+                        "info": {},
+                    },
+                }
+            )
+        path.write_text("\n".join(json.dumps(r) for r in records))
+        os.utime(path, (mtime, mtime))
+
+    for index in range(5):
+        write("recent-%d" % index, 2000 + index, with_limits=False)
+    write("older-with-limits", 1000, with_limits=True)
+
+    snapshot = _latest_snapshot(tmp_path / "sessions", 5)
+
+    assert snapshot is not None
+    assert snapshot["payload"]["rate_limits"]["primary"]["used_percent"] == 42

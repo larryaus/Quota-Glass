@@ -29,6 +29,7 @@ from app.models import (
     ModelUsageWindow,
     ProviderState,
 )
+from app.providers.live_cache import LiveSourceCache
 
 
 OAUTH_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -303,86 +304,48 @@ def _retry_after_seconds(
         return None
 
 
-class ClaudeOAuthCache:
+class ClaudeOAuthCache(LiveSourceCache):
     def __init__(
         self,
         min_interval_seconds: int = 300,
         max_backoff_seconds: int = 3600,
     ) -> None:
-        self.min_interval_seconds = max(1, min_interval_seconds)
-        self.max_backoff_seconds = max(
-            self.min_interval_seconds,
-            max_backoff_seconds,
-        )
-        self.payload: Optional[Dict[str, Any]] = None
-        self.fetched_at: Optional[datetime] = None
-        self.next_retry_at: Optional[datetime] = None
-        self.backoff_reason: Optional[str] = None
-        self._rate_limit_failures = 0
-
-    def age_seconds(self, current: datetime) -> Optional[int]:
-        if self.fetched_at is None:
-            return None
-        return max(0, int((current - self.fetched_at).total_seconds()))
-
-    def should_attempt(self, current: datetime) -> bool:
-        if self.next_retry_at is not None and current < self.next_retry_at:
-            return False
-        age = self.age_seconds(current)
-        return age is None or age >= self.min_interval_seconds
-
-    def is_backed_off(self, current: datetime) -> bool:
-        return (
-            self.next_retry_at is not None
-            and current < self.next_retry_at
-            and self.backoff_reason is not None
+        super().__init__(
+            "Claude OAuth",
+            min_interval_seconds=min_interval_seconds,
+            max_backoff_seconds=max_backoff_seconds,
         )
 
-    def record_success(
-        self,
-        payload: Dict[str, Any],
-        current: datetime,
-    ) -> None:
-        self.payload = payload
-        self.fetched_at = current
-        self.next_retry_at = None
-        self.backoff_reason = None
-        self._rate_limit_failures = 0
-
-    def _exponential_backoff_seconds(self) -> int:
-        delay = self.min_interval_seconds
-        for _ in range(max(0, self._rate_limit_failures - 1)):
-            if delay >= self.max_backoff_seconds:
-                return self.max_backoff_seconds
-            delay = min(self.max_backoff_seconds, delay * 2)
-        return delay
-
-    def record_failure(
+    def _classify_failure(
         self,
         exc: Exception,
         current: datetime,
-    ) -> None:
+    ) -> Tuple[int, str]:
         is_rate_limit = (
             isinstance(exc, httpx.HTTPStatusError)
             and exc.response.status_code == 429
         )
-        if is_rate_limit:
-            self._rate_limit_failures += 1
-            retry_after = _retry_after_seconds(exc, current)
-            if retry_after is None:
-                delay = self._exponential_backoff_seconds()
-                retry_detail = "exponential backoff %ds" % delay
-            else:
-                delay = retry_after
-                retry_detail = "Retry-After %ds" % delay
-            self.backoff_reason = (
-                "Rate limited by Claude OAuth (429 Too Many Requests; %s): %s"
-                % (retry_detail, exc)
+        if not is_rate_limit:
+            # Non-429 failures retry at the floor interval and must NOT touch
+            # the counter, matching the behaviour this class had before the
+            # base class existed.
+            return (
+                self.min_interval_seconds,
+                "Claude OAuth request failed: %s" % exc,
             )
+        self._consecutive_failures += 1
+        retry_after = _retry_after_seconds(exc, current)
+        if retry_after is None:
+            delay = self._exponential_backoff_seconds()
+            retry_detail = "exponential backoff %ds" % delay
         else:
-            delay = self.min_interval_seconds
-            self.backoff_reason = "Claude OAuth request failed: %s" % exc
-        self.next_retry_at = current + timedelta(seconds=delay)
+            delay = retry_after
+            retry_detail = "Retry-After %ds" % delay
+        return (
+            delay,
+            "Rate limited by Claude OAuth (429 Too Many Requests; %s): %s"
+            % (retry_detail, exc),
+        )
 
 
 def _normalize_reset_at(value: Any) -> Optional[int]:

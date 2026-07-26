@@ -30,9 +30,56 @@ if [[ ! -d "$REPO_DIR/frontend/node_modules" ]]; then
   exit 1
 fi
 
+BACKEND_PORT=8000
+
+# Bind-test the port the same way uvicorn will, so a conflict surfaces here as
+# a readable message instead of a buried traceback after both children start.
+# SO_REUSEADDR matters: uvicorn sets it, so without it this probe is stricter
+# than the server it guards and reports a false conflict against the lingering
+# TIME_WAIT sockets left by a just-stopped instance — i.e. on every restart.
+port_is_busy() {
+  "$REPO_DIR/.venv/bin/python" - "$1" <<'PY'
+import socket
+import sys
+
+with socket.socket() as probe:
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind(("127.0.0.1", int(sys.argv[1])))
+    except OSError:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# Name the process listening on a port, so the conflict message says which
+# one to stop instead of leaving the user to hunt for it.
+port_holder() {
+  local holder_pid holder_cmd
+  holder_pid="$(lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true)"
+  [[ -n "$holder_pid" ]] || return 0
+  holder_cmd="$(ps -o comm= -p "$holder_pid" 2>/dev/null || true)"
+  if [[ -n "$holder_cmd" ]]; then
+    printf ' by %s (PID %s)' "${holder_cmd##*/}" "$holder_pid"
+  else
+    printf ' (PID %s)' "$holder_pid"
+  fi
+}
+
+# Non-zero (after explaining why) when the backend port cannot be used.
+preflight_backend_port() {
+  port_is_busy "$1" || return 0
+  echo "Port $1 is already in use$(port_holder "$1")."
+  echo "Quota Glass is probably already running. Open http://127.0.0.1:5173 to"
+  echo "use it, or stop that instance before starting another."
+  return 1
+}
+
+preflight_backend_port "$BACKEND_PORT" || exit 1
+
 cd "$REPO_DIR"
 "$REPO_DIR/.venv/bin/python" -m uvicorn app.main:app \
-  --host 127.0.0.1 --port 8000 &
+  --host 127.0.0.1 --port "$BACKEND_PORT" &
 BACKEND_PID=$!
 
 cd "$REPO_DIR/frontend"
@@ -44,3 +91,21 @@ FRONTEND_PID=$!
 while kill -0 "$BACKEND_PID" 2>/dev/null && kill -0 "$FRONTEND_PID" 2>/dev/null; do
   sleep 1
 done
+
+# Exit with the dead child's status. Falling off the end here returns 0, which
+# makes a crashed backend look like a clean shutdown.
+status=0
+if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+  label="Backend"
+  wait "$BACKEND_PID" 2>/dev/null || status=$?
+  BACKEND_PID=""
+else
+  label="Frontend"
+  wait "$FRONTEND_PID" 2>/dev/null || status=$?
+  FRONTEND_PID=""
+fi
+
+if [[ "$status" -ne 0 ]]; then
+  echo "$label exited with status $status."
+fi
+exit "$status"

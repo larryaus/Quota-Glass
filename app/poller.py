@@ -9,6 +9,7 @@ from app.database import Database
 from app.models import DashboardState, Meter, PollerHealth, ProviderState
 from app.providers.chatgpt import parse_chatgpt
 from app.providers.claude import ClaudeOAuthCache, parse_claude
+from app.providers.live_cache import LiveSourceCache
 from app.settings import Settings
 
 
@@ -40,9 +41,21 @@ class UsagePoller:
             settings.oauth_min_interval_seconds,
             settings.oauth_max_backoff_seconds,
         )
+        self._chatgpt_live_cache = LiveSourceCache(
+            "Codex CLI",
+            settings.chatgpt_live_min_interval_seconds,
+            settings.oauth_max_backoff_seconds,
+        )
 
     async def refresh(self) -> DashboardState:
-        await asyncio.to_thread(self._refresh_lock.acquire)
+        # Never queue for the lock. Waiting would park a thread-pool worker,
+        # and the holder needs workers of its own (parse_chatgpt, alerting,
+        # sample persistence); enough waiters and it can never finish, never
+        # release, and the poller never recovers. A caller that arrives
+        # mid-poll gets the current state and the in-flight result lands
+        # moments later; the background loop retries on its next interval.
+        if not self._refresh_lock.acquire(blocking=False):
+            return self.state()
         try:
             started = time.monotonic()
             self.health.running = True
@@ -58,6 +71,10 @@ class UsagePoller:
                         self.settings.codex_sessions_dir,
                         self.settings.stale_after_minutes,
                         candidate_file_count=self.settings.chatgpt_candidate_files,
+                        enable_live=self.settings.enable_chatgpt_live,
+                        live_cache=self._chatgpt_live_cache,
+                        cli_path=self.settings.codex_cli_path,
+                        cli_timeout_seconds=self.settings.codex_cli_timeout_seconds,
                     )
                     polled_providers.append("chatgpt")
                 except Exception as exc:
