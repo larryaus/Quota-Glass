@@ -14,7 +14,11 @@ from app.models import (
     ModelUsageWindow,
     ProviderState,
 )
-from app.providers.codex_cli import CodexCliError, read_account_rate_limits
+from app.providers.codex_cli import (
+    CodexCliError,
+    CodexCliProtocolError,
+    read_account_rate_limits,
+)
 from app.providers.live_cache import LiveSourceCache
 
 
@@ -434,6 +438,30 @@ def _live_meters(rate_limits: JsonDict) -> List[Meter]:
     return meters
 
 
+def _live_reading(payload: Any) -> Tuple[JsonDict, List[Meter]]:
+    """Return the rate limits and meters carried by a live payload.
+
+    Raises CodexCliProtocolError when the payload cannot produce a single
+    quota window, so a renamed or restructured response is treated as a live
+    failure instead of as a successful reading with an empty card.
+    """
+    if not isinstance(payload, dict):
+        raise CodexCliProtocolError(
+            "codex app-server returned a non-object rate limit payload"
+        )
+    rate_limits = payload.get("rateLimits")
+    if not isinstance(rate_limits, dict):
+        raise CodexCliProtocolError(
+            "codex app-server response had no rateLimits object"
+        )
+    meters = _live_meters(rate_limits)
+    if not meters:
+        raise CodexCliProtocolError(
+            "codex app-server response contained no recognizable quota windows"
+        )
+    return rate_limits, meters
+
+
 def _live_credits(rate_limits: JsonDict) -> Credits:
     raw = rate_limits.get("credits")
     if not isinstance(raw, dict):
@@ -470,14 +498,24 @@ def parse_chatgpt(
     if live_cache.should_attempt(current):
         try:
             payload = reader(cli_path, cli_timeout_seconds)
+            # Validate before caching so a successful cache entry always
+            # contains quota meters that can be served on later failures.
+            _live_reading(payload)
             live_cache.record_success(payload, current)
         except CodexCliError as exc:
             live_cache.record_failure(exc, current)
         except Exception as exc:  # noqa: BLE001 - never let the poller die
             live_cache.record_failure(exc, current)
 
-    payload = live_cache.payload
-    if payload is None:
+    reading: Optional[Tuple[JsonDict, List[Meter]]] = None
+    if live_cache.payload is not None and live_cache.fetched_at is not None:
+        try:
+            reading = _live_reading(live_cache.payload)
+        except CodexCliError:
+            # Defensive: a cache entry is validated before it is stored, so
+            # this only fires if a payload was injected past that guard.
+            reading = None
+    if reading is None:
         # Never succeeded: a rollout reading beats no reading at all.
         return _parse_chatgpt_rollout(
             sessions_dir,
@@ -485,23 +523,7 @@ def parse_chatgpt(
             now,
             candidate_file_count,
         )
-
-    if not isinstance(payload, dict):
-        return _parse_chatgpt_rollout(
-            sessions_dir,
-            stale_after_minutes,
-            now,
-            candidate_file_count,
-        )
-
-    rate_limits = payload.get("rateLimits")
-    if not isinstance(rate_limits, dict):
-        return _parse_chatgpt_rollout(
-            sessions_dir,
-            stale_after_minutes,
-            now,
-            candidate_file_count,
-        )
+    rate_limits, meters = reading
 
     local_usage, model_usage = _chatgpt_usage(Path(sessions_dir), current)
     backed_off = live_cache.is_backed_off(current)
@@ -509,7 +531,7 @@ def parse_chatgpt(
         key="chatgpt",
         label="ChatGPT",
         mode="oauth",
-        meters=_live_meters(rate_limits),
+        meters=meters,
         credits=_live_credits(rate_limits),
         plan_type=rate_limits.get("planType"),
         error=None,

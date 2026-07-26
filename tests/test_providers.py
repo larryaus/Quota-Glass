@@ -544,6 +544,96 @@ def test_chatgpt_falls_back_to_rollout_when_live_payload_is_not_a_dict(
     assert state.meters[0].source == "rollout"
 
 
+def test_chatgpt_falls_back_when_live_payload_has_no_known_windows(
+    tmp_path, fixture_dir
+):
+    """A renamed window key is a protocol change, not a usable reading.
+
+    Serving it as a successful live response would leave the card emptier than
+    rollout-only mode, and caching it would suppress retries for the whole
+    minimum interval.
+    """
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.live_cache import LiveSourceCache
+
+    sessions = tmp_path / "2026" / "07" / "25"
+    sessions.mkdir(parents=True)
+    source = fixture_dir / "chatgpt" / "2026" / "07" / "25" / "rollout-example.jsonl"
+    (sessions / "rollout-example.jsonl").write_text(source.read_text())
+
+    drifted = {
+        "rateLimits": {
+            "primaryLimit": {
+                "usedPercent": 18,
+                "windowDurationMins": 10080,
+                "resetsAt": 1785621948,
+            },
+            "planType": "plus",
+        }
+    }
+    cache = LiveSourceCache("Codex CLI")
+
+    state = parse_chatgpt(
+        tmp_path,
+        enable_live=True,
+        live_cache=cache,
+        live_reader=lambda cli_path, timeout_seconds: drifted,
+    )
+
+    assert state.mode == "local"
+    assert [meter.key for meter in state.meters] == ["chatgpt.primary"]
+    assert state.meters[0].source == "rollout"
+    assert state.meters[0].used_pct == 87.5
+    assert cache.payload is None, "an unusable live payload must not be cached"
+    assert cache.backoff_reason is not None
+    assert "quota window" in cache.backoff_reason
+    assert "snapshot" not in cache.backoff_reason, (
+        "the live path must not borrow the rollout path's wording"
+    )
+
+
+def test_chatgpt_does_not_serve_a_cached_payload_without_known_windows(
+    tmp_path, fixture_dir
+):
+    """A later live failure must not resurrect an unusable cached payload."""
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.codex_cli import CodexCliTimeout
+    from app.providers.live_cache import LiveSourceCache
+
+    sessions = tmp_path / "2026" / "07" / "25"
+    sessions.mkdir(parents=True)
+    source = fixture_dir / "chatgpt" / "2026" / "07" / "25" / "rollout-example.jsonl"
+    (sessions / "rollout-example.jsonl").write_text(source.read_text())
+
+    drifted = {"rateLimits": {"primaryLimit": {"usedPercent": 18}}}
+    cache = LiveSourceCache("Codex CLI", min_interval_seconds=1)
+    first_call = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+    second_call = datetime(2026, 7, 26, 12, 0, 30, tzinfo=timezone.utc)
+
+    parse_chatgpt(
+        tmp_path,
+        now=first_call,
+        enable_live=True,
+        live_cache=cache,
+        live_reader=lambda cli_path, timeout_seconds: drifted,
+    )
+
+    def failing_reader(cli_path, timeout_seconds):
+        raise CodexCliTimeout("codex app-server hung")
+
+    state = parse_chatgpt(
+        tmp_path,
+        now=second_call,
+        enable_live=True,
+        live_cache=cache,
+        live_reader=failing_reader,
+    )
+
+    assert state.mode == "local"
+    assert [meter.key for meter in state.meters] == ["chatgpt.primary"]
+    assert state.meters[0].source == "rollout"
+
+
 def test_claude_local_parser_aggregates_windows_and_cost(fixture_dir):
     state = parse_claude_local(
         fixture_dir / "claude",
