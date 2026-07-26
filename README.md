@@ -6,9 +6,12 @@ local token estimates, model-by-model token percentages split by effort level,
 credits, provider errors, and recent alert events.
 A FastAPI process reads local usage files, persists samples and alert state in
 SQLite, and uses built-in `osascript` notifications when a quota is exhausted
-and when it refreshes.
+and when it refreshes. Optional SMTP email notifications can deliver the same
+alerts away from the Mac running Quota Glass.
 
-Everything runs locally. No API key or vendor billing organization is needed.
+The dashboard and its data stay local. Email, Claude OAuth, and live ChatGPT
+quota are opt-in network features. No provider API key or vendor billing
+organization is needed for the core dashboard.
 
 ## Data sources
 
@@ -86,6 +89,15 @@ Set environment variables before running `./run.sh`:
 | `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | Injectable Codex rollout root. |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Injectable Claude project root. |
 | `NOTIFICATIONS_ENABLED` | `1` | Set to `0` to suppress macOS notifications. |
+| `EMAIL_NOTIFICATIONS_ENABLED` | `0` | Set to `1` to send alert emails over SMTP. |
+| `EMAIL_TO` | empty | Comma-separated alert recipients; required for email. |
+| `EMAIL_FROM` | `SMTP_USERNAME` | Sender address; required when the SMTP username is not an email address or authentication is disabled. |
+| `SMTP_HOST` | empty | SMTP server hostname; required for email. |
+| `SMTP_PORT` | `587` (`465` with `ssl`) | SMTP server port. |
+| `SMTP_USERNAME` | empty | Optional SMTP login; must be paired with `SMTP_PASSWORD`. |
+| `SMTP_PASSWORD` | empty | SMTP password or provider-issued app password. |
+| `SMTP_SECURITY` | `starttls` | Transport security: `starttls`, `ssl`, or `none`. |
+| `SMTP_TIMEOUT_SECONDS` | `10` | Timeout for an SMTP connection and send. |
 | `DATABASE_PATH` | `./data/usage.db` | SQLite file location. |
 
 Example:
@@ -93,6 +105,35 @@ Example:
 ```bash
 POLL_INTERVAL_SECONDS=30 NOTIFICATIONS_ENABLED=0 ./run.sh
 ```
+
+## Email alerts
+
+Email notifications use the existing durable quota events: crossing from below
+the configured threshold to 100% sends **Quota exhausted**, and the first
+low-water reading after exhaustion sends **Quota refreshed**. A normal reset is
+reported at 0%; `ALERT_RESET_PCT=5` also catches the reset when the first
+post-reset poll has already risen slightly above zero. Each quota window alerts
+only once, and failed SMTP deliveries use the same retry limit as macOS
+notifications.
+
+Export your SMTP settings in the shell that starts Quota Glass:
+
+```bash
+export EMAIL_NOTIFICATIONS_ENABLED=1
+export EMAIL_TO="you@example.com"
+export EMAIL_FROM="you@example.com"
+export SMTP_HOST="smtp.example.com"
+export SMTP_PORT=587
+export SMTP_USERNAME="you@example.com"
+export SMTP_PASSWORD="your-provider-issued-app-password"
+export SMTP_SECURITY="starttls"
+./run.sh
+```
+
+Use an app-specific SMTP password when your mail provider supports one. Keep
+the password out of committed files and shell scripts. Set
+`NOTIFICATIONS_ENABLED=0` if email should replace, rather than supplement, the
+local macOS notification.
 
 ## Claude OAuth opt-in: unsupported and fragile
 

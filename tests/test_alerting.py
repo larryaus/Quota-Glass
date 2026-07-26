@@ -79,6 +79,19 @@ def test_low_water_refreshes_even_without_window_change(tmp_path, recording_noti
     assert alerts.process(meter(4), now=103) == []
 
 
+def test_reset_to_zero_notifies_after_exhaustion(tmp_path, recording_notifier):
+    _, alerts = engine(tmp_path, recording_notifier)
+    alerts.process(meter(99), now=100)
+    alerts.process(meter(100), now=101)
+
+    assert alerts.process(meter(0), now=102) == ["REFRESHED"]
+    assert recording_notifier.calls[-1] == (
+        "Quota refreshed",
+        "Primary limit",
+        "ChatGPT usage reset to 0% and is available again.",
+    )
+
+
 def test_restart_rehydrates_and_does_not_double_fire(tmp_path, recording_notifier):
     database, alerts = engine(tmp_path, recording_notifier)
     alerts.process(meter(90), now=100)
