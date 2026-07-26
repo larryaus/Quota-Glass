@@ -25,11 +25,14 @@ from app.models import (
     Credits,
     LocalUsageWindow,
     Meter,
-    ModelUsage,
-    ModelUsageWindow,
     ProviderState,
 )
 from app.providers.live_cache import LiveSourceCache
+from app.providers.usage import (
+    UNSPECIFIED_EFFORT,
+    model_usage_window,
+    normalize_effort,
+)
 
 
 OAUTH_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -91,30 +94,16 @@ def _empty_window(label: str) -> Dict[str, Any]:
     }
 
 
-def _model_usage_window(
-    label: str,
-    window_minutes: int,
-    counts: Dict[str, int],
-) -> ModelUsageWindow:
-    total = sum(counts.values())
-    models = [
-        ModelUsage(
-            model=model,
-            tokens=tokens,
-            percentage=round(tokens * 100.0 / total, 1) if total else 0.0,
-        )
-        for model, tokens in sorted(
-            counts.items(),
-            key=lambda item: (-item[1], item[0]),
-        )
-        if tokens > 0
-    ]
-    return ModelUsageWindow(
-        label=label,
-        window_minutes=window_minutes,
-        total_tokens=total,
-        models=models,
-    )
+def _record_effort(record: Dict[str, Any], message: Dict[str, Any]) -> str:
+    """Read the effort Claude Code recorded for one assistant turn.
+
+    Recent versions write it beside the message; the message-level lookup is a
+    cheap hedge against the field moving again.
+    """
+    effort = normalize_effort(record.get("effort"))
+    if effort == UNSPECIFIED_EFFORT:
+        effort = normalize_effort(message.get("effort"))
+    return effort
 
 
 def parse_claude_local(
@@ -126,7 +115,7 @@ def parse_claude_local(
         (timedelta(hours=5), _empty_window("Last 5 hours")),
         (timedelta(days=7), _empty_window("Last 7 days")),
     ]
-    model_counts: List[Dict[str, int]] = [{}, {}]
+    model_counts: List[Dict[Tuple[str, str], int]] = [{}, {}]
     newest: Optional[datetime] = None
     found_records = 0
 
@@ -156,6 +145,7 @@ def parse_claude_local(
                     if newest is None or observed_at > newest:
                         newest = observed_at
                     model = str(message.get("model", "unknown"))
+                    effort = _record_effort(record, message)
                     input_tokens = _usage_count(usage.get("input_tokens"))
                     cache_write = _usage_count(
                         usage.get("cache_creation_input_tokens")
@@ -181,8 +171,9 @@ def parse_claude_local(
                             counter["output_tokens"] += output_tokens
                             counter["total_tokens"] += total_tokens
                             counter["estimated_cost_usd"] += cost
-                            model_counts[index][model] = (
-                                model_counts[index].get(model, 0) + total_tokens
+                            key = (model, effort)
+                            model_counts[index][key] = (
+                                model_counts[index].get(key, 0) + total_tokens
                             )
         except (OSError, UnicodeDecodeError):
             continue
@@ -220,8 +211,8 @@ def parse_claude_local(
         last_updated=newest.isoformat().replace("+00:00", "Z") if newest else None,
         local_usage=local_usage,
         model_usage=[
-            _model_usage_window("Last 5 hours", 300, model_counts[0]),
-            _model_usage_window("Last 7 days", 10080, model_counts[1]),
+            model_usage_window("Last 5 hours", 300, model_counts[0]),
+            model_usage_window("Last 7 days", 10080, model_counts[1]),
         ],
     )
 

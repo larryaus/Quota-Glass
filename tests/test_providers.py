@@ -31,6 +31,50 @@ def _token_record(timestamp, used_pct):
     }
 
 
+def _claude_record(timestamp, model, input_tokens, output_tokens, effort):
+    record = {
+        "type": "assistant",
+        "timestamp": timestamp,
+        "message": {
+            "model": model,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
+        },
+    }
+    if effort is not None:
+        record["effort"] = effort
+    return record
+
+
+def _codex_token_record(timestamp, last_tokens, total_tokens):
+    return {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": last_tokens,
+                    "total_tokens": last_tokens,
+                },
+                "total_token_usage": {
+                    "input_tokens": total_tokens,
+                    "total_tokens": total_tokens,
+                },
+            },
+            "rate_limits": {
+                "primary": {
+                    "used_percent": 10,
+                    "window_minutes": 10080,
+                    "resets_at": 1_800_000_000,
+                }
+            },
+        },
+    }
+
+
 def _write_snapshot(path, timestamp, used_pct):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -247,6 +291,133 @@ def test_chatgpt_aggregates_model_mix_from_turn_token_deltas(tmp_path):
         usage.estimated_cost_usd is None
         for usage in state.local_usage
     )
+
+
+def test_chatgpt_splits_each_model_by_reasoning_effort(tmp_path):
+    path = tmp_path / "2026" / "07" / "26" / "rollout-efforts.jsonl"
+    path.parent.mkdir(parents=True)
+    records = [
+        {
+            "timestamp": "2026-07-26T03:00:00Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.3-codex", "effort": "medium"},
+        },
+        _codex_token_record("2026-07-26T03:01:00Z", 300, 300),
+        {
+            "timestamp": "2026-07-26T08:00:00Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.3-codex", "effort": "high"},
+        },
+        _codex_token_record("2026-07-26T08:01:00Z", 100, 400),
+        {
+            "timestamp": "2026-07-26T09:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "thread_settings": {
+                    "model": "gpt-5.3-codex-spark",
+                    "reasoning_effort": "low",
+                },
+            },
+        },
+        _codex_token_record("2026-07-26T09:01:00Z", 200, 600),
+        {
+            # A model that takes no reasoning effort reports it as null.
+            "timestamp": "2026-07-26T10:00:00Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.3-codex-spark", "effort": None},
+        },
+        _codex_token_record("2026-07-26T10:01:00Z", 100, 700),
+    ]
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    state = parse_chatgpt(
+        tmp_path,
+        now=datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc),
+    )
+
+    five_hour_models, seven_day_models = state.model_usage
+    assert five_hour_models.total_tokens == 400
+    assert [
+        (
+            item.model,
+            item.tokens,
+            [
+                (effort.effort, effort.tokens, effort.percentage)
+                for effort in item.efforts
+            ],
+        )
+        for item in five_hour_models.models
+    ] == [
+        (
+            "gpt-5.3-codex-spark",
+            300,
+            [("low", 200, 66.7), ("unspecified", 100, 33.3)],
+        ),
+        ("gpt-5.3-codex", 100, [("high", 100, 100.0)]),
+    ]
+    assert seven_day_models.total_tokens == 700
+    assert [
+        (
+            item.model,
+            item.tokens,
+            [
+                (effort.effort, effort.tokens, effort.percentage)
+                for effort in item.efforts
+            ],
+        )
+        for item in seven_day_models.models
+    ] == [
+        (
+            "gpt-5.3-codex",
+            400,
+            [("medium", 300, 75.0), ("high", 100, 25.0)],
+        ),
+        (
+            "gpt-5.3-codex-spark",
+            300,
+            [("low", 200, 66.7), ("unspecified", 100, 33.3)],
+        ),
+    ]
+
+
+def test_chatgpt_turn_context_without_effort_keeps_the_active_one(tmp_path):
+    path = tmp_path / "2026" / "07" / "26" / "rollout-effort-carryover.jsonl"
+    path.parent.mkdir(parents=True)
+    records = [
+        {
+            "timestamp": "2026-07-26T09:00:00Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.3-codex", "effort": "high"},
+        },
+        _codex_token_record("2026-07-26T09:01:00Z", 100, 100),
+        {
+            "timestamp": "2026-07-26T10:00:00Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.3-codex-spark"},
+        },
+        _codex_token_record("2026-07-26T10:01:00Z", 100, 200),
+    ]
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    state = parse_chatgpt(
+        tmp_path,
+        now=datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert [
+        (item.model, [effort.effort for effort in item.efforts])
+        for item in state.model_usage[0].models
+    ] == [
+        ("gpt-5.3-codex", ["high"]),
+        ("gpt-5.3-codex-spark", ["high"]),
+    ]
 
 
 def test_chatgpt_cumulative_baseline_excludes_pre_window_usage(tmp_path):
@@ -742,6 +913,69 @@ def test_claude_local_parser_aggregates_windows_and_cost(fixture_dir):
     assert [(item.model, item.percentage) for item in seven_day_models.models] == [
         ("claude-sonnet-4-20250514", 79.0),
         ("claude-haiku-3-5", 21.0),
+    ]
+    assert [
+        (item.model, [(effort.effort, effort.tokens, effort.percentage)
+                      for effort in item.efforts])
+        for item in seven_day_models.models
+    ] == [
+        ("claude-sonnet-4-20250514", [("high", 2260, 100.0)]),
+        ("claude-haiku-3-5", [("unspecified", 600, 100.0)]),
+    ]
+
+
+def test_claude_local_parser_splits_each_model_by_effort(tmp_path):
+    path = tmp_path / "project" / "session.jsonl"
+    path.parent.mkdir(parents=True)
+    records = [
+        _claude_record("2026-07-26T11:00:00Z", "claude-opus-5", 100, 100, "xhigh"),
+        # Casing and padding come from the record, not from a fixed vocabulary.
+        _claude_record("2026-07-26T11:10:00Z", "claude-opus-5", 50, 50, "  High "),
+        _claude_record("2026-07-26T11:20:00Z", "claude-opus-5", 50, 50, None),
+        _claude_record("2026-07-26T11:30:00Z", "claude-sonnet-5", 100, 100, None),
+        _claude_record("2026-07-20T11:00:00Z", "claude-opus-5", 200, 200, "xhigh"),
+    ]
+    # Older records carried effort on the message instead of beside it.
+    records[3]["message"]["effort"] = "medium"
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    state = parse_claude_local(
+        tmp_path,
+        now=datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc),
+    )
+
+    five_hour_models, seven_day_models = state.model_usage
+    assert five_hour_models.total_tokens == 600
+    assert [
+        (item.model, item.tokens, item.percentage)
+        for item in five_hour_models.models
+    ] == [
+        ("claude-opus-5", 400, 66.7),
+        ("claude-sonnet-5", 200, 33.3),
+    ]
+    assert [
+        (effort.effort, effort.tokens, effort.percentage)
+        for effort in five_hour_models.models[0].efforts
+    ] == [
+        ("xhigh", 200, 50.0),
+        ("high", 100, 25.0),
+        ("unspecified", 100, 25.0),
+    ]
+    assert [
+        (effort.effort, effort.tokens, effort.percentage)
+        for effort in five_hour_models.models[1].efforts
+    ] == [("medium", 200, 100.0)]
+    assert seven_day_models.total_tokens == 1000
+    assert [
+        (effort.effort, effort.tokens, effort.percentage)
+        for effort in seven_day_models.models[0].efforts
+    ] == [
+        ("xhigh", 600, 75.0),
+        ("high", 100, 12.5),
+        ("unspecified", 100, 12.5),
     ]
 
 
