@@ -518,6 +518,32 @@ def test_chatgpt_live_disabled_keeps_local_mode(tmp_path, fixture_dir):
     assert state.meters[0].source == "rollout"
 
 
+def test_chatgpt_falls_back_to_rollout_when_live_payload_is_not_a_dict(
+    tmp_path, fixture_dir
+):
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.live_cache import LiveSourceCache
+
+    sessions = tmp_path / "2026" / "07" / "25"
+    sessions.mkdir(parents=True)
+    source = fixture_dir / "chatgpt" / "2026" / "07" / "25" / "rollout-example.jsonl"
+    (sessions / "rollout-example.jsonl").write_text(source.read_text())
+
+    def malformed_reader(cli_path, timeout_seconds):
+        return ["not", "a", "dict"]
+
+    state = parse_chatgpt(
+        tmp_path,
+        enable_live=True,
+        live_cache=LiveSourceCache("Codex CLI"),
+        live_reader=malformed_reader,
+    )
+
+    assert state.mode == "local"
+    assert state.meters, "rollout meters must still render when the live payload is malformed"
+    assert state.meters[0].source == "rollout"
+
+
 def test_claude_local_parser_aggregates_windows_and_cost(fixture_dir):
     state = parse_claude_local(
         fixture_dir / "claude",

@@ -486,6 +486,14 @@ def parse_chatgpt(
             candidate_file_count,
         )
 
+    if not isinstance(payload, dict):
+        return _parse_chatgpt_rollout(
+            sessions_dir,
+            stale_after_minutes,
+            now,
+            candidate_file_count,
+        )
+
     rate_limits = payload.get("rateLimits")
     if not isinstance(rate_limits, dict):
         return _parse_chatgpt_rollout(
