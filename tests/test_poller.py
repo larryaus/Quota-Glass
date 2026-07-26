@@ -1,0 +1,248 @@
+import asyncio
+import time
+
+import pytest
+
+from app.alerting import AlertEngine
+from app.database import Database
+from app.models import Meter, ProviderState
+from app.notifier import NullNotifier
+from app.poller import UsagePoller
+from app.settings import Settings
+
+
+def quota_meter(
+    provider="chatgpt",
+    pct=100.0,
+    resets_at=1_800_000_000,
+):
+    return Meter(
+        key="%s.primary" % provider,
+        provider=provider,
+        label="Primary limit",
+        used_pct=pct,
+        window_minutes=300,
+        resets_at=resets_at,
+        has_quota=True,
+        source="rollout",
+        stale=False,
+    )
+
+
+def poller_settings(tmp_path, **kwargs):
+    values = {
+        "enable_claude_oauth": False,
+        "poll_interval_seconds": 60,
+        "codex_sessions_dir": tmp_path / "chatgpt",
+        "claude_projects_dir": tmp_path / "claude",
+        "notifications_enabled": False,
+        "database_path": tmp_path / "usage.db",
+    }
+    values.update(kwargs)
+    return Settings(**values)
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_does_not_block_other_alerts_or_samples(
+    monkeypatch,
+    tmp_path,
+):
+    def broken_chatgpt(*args, **kwargs):
+        raise RuntimeError("broken rollout")
+
+    async def working_claude(*args, **kwargs):
+        return ProviderState(
+            key="claude",
+            label="Claude",
+            mode="oauth",
+            meters=[quota_meter("claude", 100)],
+        )
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", broken_chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", working_claude)
+    settings = poller_settings(tmp_path)
+    database = Database(settings.database_path)
+    alerts = AlertEngine(database, NullNotifier())
+    alerts.process(quota_meter("claude", 90), now=100)
+    poller = UsagePoller(settings, database, alerts)
+
+    state = await poller.refresh()
+
+    assert state.providers[0].error == "ChatGPT polling failed: broken rollout"
+    assert state.providers[1].meters[0].used_pct == 100
+    assert database.get_events()[0]["meter_key"] == "claude.primary"
+    sample_count = database._connection.execute(
+        "SELECT COUNT(*) FROM samples WHERE meter_key = 'claude.primary'"
+    ).fetchone()[0]
+    assert sample_count == 1
+    assert state.poller.status == "degraded"
+
+
+class SleepingNotifier:
+    def __init__(self):
+        self.started = None
+        self.completed = None
+
+    def notify(self, title, subtitle, message):
+        self.started = time.monotonic()
+        time.sleep(0.15)
+        self.completed = time.monotonic()
+
+
+@pytest.mark.asyncio
+async def test_notification_delivery_does_not_block_event_loop(
+    monkeypatch,
+    tmp_path,
+):
+    notifier = SleepingNotifier()
+
+    def chatgpt(*args, **kwargs):
+        return ProviderState(
+            key="chatgpt",
+            label="ChatGPT",
+            mode="local",
+            meters=[quota_meter("chatgpt", 100)],
+        )
+
+    async def claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", claude)
+    settings = poller_settings(tmp_path)
+    database = Database(settings.database_path)
+    alerts = AlertEngine(database, notifier)
+    alerts.process(quota_meter("chatgpt", 90), now=100)
+    poller = UsagePoller(settings, database, alerts)
+
+    refresh_task = asyncio.create_task(poller.refresh())
+    while notifier.started is None:
+        await asyncio.sleep(0.001)
+    heartbeat = time.monotonic()
+    await refresh_task
+
+    assert notifier.started < heartbeat < notifier.completed
+
+
+class AlwaysFailNotifier:
+    def notify(self, title, subtitle, message):
+        raise RuntimeError("notifications disabled by system")
+
+
+@pytest.mark.asyncio
+async def test_notification_failure_is_exposed_in_poller_health(
+    monkeypatch,
+    tmp_path,
+):
+    def chatgpt(*args, **kwargs):
+        return ProviderState(
+            key="chatgpt",
+            label="ChatGPT",
+            mode="local",
+            meters=[quota_meter("chatgpt", 100)],
+        )
+
+    async def claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", claude)
+    settings = poller_settings(tmp_path)
+    database = Database(settings.database_path)
+    alerts = AlertEngine(database, AlwaysFailNotifier())
+    alerts.process(quota_meter("chatgpt", 90), now=100)
+    poller = UsagePoller(settings, database, alerts)
+
+    state = await poller.refresh()
+
+    assert state.poller.status == "degraded"
+    assert "notifications disabled by system" in state.poller.last_error
+
+
+@pytest.mark.asyncio
+async def test_background_task_liveness_and_completion_age(
+    monkeypatch,
+    tmp_path,
+):
+    def chatgpt(*args, **kwargs):
+        return ProviderState(key="chatgpt", label="ChatGPT", mode="local")
+
+    async def claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", claude)
+    settings = poller_settings(tmp_path)
+    database = Database(settings.database_path)
+    poller = UsagePoller(
+        settings,
+        database,
+        AlertEngine(database, NullNotifier()),
+    )
+
+    task = asyncio.create_task(poller.run())
+    while poller.health.poll_count == 0:
+        await asyncio.sleep(0.001)
+    state = poller.state()
+    assert state.poller.running is False
+    assert state.poller.background_task_alive is True
+    assert state.poller.last_poll_completed_age_seconds is not None
+
+    poller.stop()
+    await task
+    assert poller.state().poller.background_task_alive is False
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_keeps_polling_while_claude_oauth_is_cached(
+    monkeypatch,
+    tmp_path,
+):
+    chatgpt_calls = []
+    keychain_reads = []
+    oauth_calls = []
+
+    def chatgpt(*args, **kwargs):
+        chatgpt_calls.append(True)
+        return ProviderState(key="chatgpt", label="ChatGPT", mode="local")
+
+    def read_token():
+        keychain_reads.append(True)
+        return "token"
+
+    async def oauth_usage(token):
+        oauth_calls.append(token)
+        return {
+            "five_hour": {
+                "utilization": 50,
+                "resets_at": "2026-07-26T07:00:00Z",
+            }
+        }
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", chatgpt)
+    monkeypatch.setattr(
+        "app.providers.claude._read_keychain_token",
+        read_token,
+    )
+    monkeypatch.setattr(
+        "app.providers.claude._fetch_oauth_usage",
+        oauth_usage,
+    )
+    settings = poller_settings(
+        tmp_path,
+        enable_claude_oauth=True,
+        oauth_min_interval_seconds=300,
+    )
+    database = Database(settings.database_path)
+    poller = UsagePoller(
+        settings,
+        database,
+        AlertEngine(database, NullNotifier()),
+    )
+
+    await poller.refresh()
+    await poller.refresh()
+
+    assert len(chatgpt_calls) == 2
+    assert len(keychain_reads) == 1
+    assert oauth_calls == ["token"]

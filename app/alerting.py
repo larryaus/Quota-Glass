@@ -1,0 +1,145 @@
+import time
+from typing import Any, Dict, List, Optional
+
+from app.database import Database
+from app.models import Meter
+from app.notifier import Notifier
+
+
+RESET_DROP_EPSILON_PCT = 10.0
+DEFAULT_MAX_NOTIFICATION_ATTEMPTS = 3
+
+
+class AlertEngine:
+    def __init__(
+        self,
+        database: Database,
+        notifier: Notifier,
+        threshold_pct: float = 100.0,
+        reset_pct: float = 5.0,
+        reset_drop_epsilon_pct: float = RESET_DROP_EPSILON_PCT,
+        max_notification_attempts: int = DEFAULT_MAX_NOTIFICATION_ATTEMPTS,
+    ) -> None:
+        self.database = database
+        self.notifier = notifier
+        self.threshold_pct = threshold_pct
+        self.reset_pct = reset_pct
+        self.reset_drop_epsilon_pct = reset_drop_epsilon_pct
+        self.max_notification_attempts = max(1, max_notification_attempts)
+        self.last_errors: List[str] = []
+
+    def process(self, meter: Meter, now: Optional[int] = None) -> List[str]:
+        self.last_errors = []
+        if not meter.has_quota or meter.stale or meter.used_pct is None:
+            self._deliver_pending(meter.key)
+            return []
+
+        event_time = int(time.time()) if now is None else now
+        current_window = meter.resets_at
+        # SQLite NULL means "not latched", so 0 is the stable identity for a
+        # quota meter that does not publish a reset timestamp.
+        latch_window = current_window if current_window is not None else 0
+        state = self.database.get_meter_state(meter.key)
+        if state is None or bool(state["reseed_required"]):
+            self.database.put_meter_state(
+                meter.key, meter.used_pct, current_window, None, None
+            )
+            self._deliver_pending(meter.key)
+            return []
+
+        previous_pct = state["last_pct"]
+        fired_window = state["fired_full_for_window"]
+        last_event_at = state["last_event_at"]
+        events: List[str] = []
+
+        window_changed = state["window_id"] != current_window
+        usage_drop = (
+            previous_pct is not None
+            and float(previous_pct) - meter.used_pct
+            > self.reset_drop_epsilon_pct
+        )
+        low_water = (
+            fired_window is not None and meter.used_pct < self.reset_pct
+        )
+        rolled_over = window_changed or usage_drop or low_water
+        baseline = previous_pct
+        if rolled_over:
+            if fired_window is not None:
+                events.append("REFRESHED")
+            fired_window = None
+            # A reset starts a new series at zero even if the first observation
+            # arrives after the new window has already filled.
+            baseline = 0.0
+
+        crossed = (
+            baseline is not None
+            and float(baseline) < self.threshold_pct
+            and meter.used_pct >= self.threshold_pct
+            and fired_window != latch_window
+        )
+        if crossed:
+            events.append("EXHAUSTED")
+            fired_window = latch_window
+
+        if events:
+            last_event_at = event_time
+
+        self.database.record_events_and_state(
+            events,
+            meter,
+            current_window,
+            event_time,
+            fired_window,
+            last_event_at,
+        )
+        # Pending rows and the detection latch are durable before any external
+        # notification attempt. A crash here retries the same row after restart.
+        self._deliver_pending(meter.key)
+        return events
+
+    def record_poll_presence(
+        self,
+        seen_keys: List[str],
+        polled_providers: List[str],
+    ) -> None:
+        self.database.mark_meter_presence(seen_keys, polled_providers)
+
+    def _deliver_pending(self, meter_key: str) -> None:
+        pending = self.database.get_pending_notifications(
+            meter_key,
+            self.max_notification_attempts,
+        )
+        for event in pending:
+            try:
+                self._notify_event(event)
+            except Exception as exc:
+                error = "Notification delivery failed for %s: %s" % (
+                    event["meter_key"],
+                    exc,
+                )
+                self.database.mark_notification_failed(
+                    int(event["id"]),
+                    error,
+                    self.max_notification_attempts,
+                )
+                self.last_errors.append(error)
+            else:
+                self.database.mark_notification_delivered(int(event["id"]))
+
+    def _notify_event(self, event: Dict[str, Any]) -> None:
+        event_type = str(event["event_type"])
+        provider = str(event["provider"]).title()
+        label = str(event["label"])
+        if event_type == "REFRESHED":
+            self.notifier.notify(
+                "Quota refreshed",
+                label,
+                "%s usage is available again." % provider,
+            )
+            return
+        used_pct = event["used_pct"]
+        self.notifier.notify(
+            "Quota exhausted",
+            label,
+            "%s reached %.0f%% usage." % (provider, float(used_pct)),
+        )

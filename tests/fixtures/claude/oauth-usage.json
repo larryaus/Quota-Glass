@@ -1,0 +1,80 @@
+{
+  "five_hour": {
+    "utilization": 100.0,
+    "resets_at": "2026-07-26T02:09:59.368138+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day": {
+    "utilization": 12.0,
+    "resets_at": "2026-07-30T01:59:59.368154+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day_oauth_apps": null,
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "seven_day_cowork": null,
+  "seven_day_omelette": null,
+  "tangelo": null,
+  "iguana_necktie": null,
+  "omelette_promotional": null,
+  "nimbus_quill": null,
+  "cinder_cove": null,
+  "amber_ladder": null,
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": null,
+    "used_credits": 973.0,
+    "utilization": null,
+    "currency": "AUD",
+    "decimal_places": 2,
+    "disabled_reason": null,
+    "user_disabled": false,
+    "spend_limit_reached": false,
+    "credits_ever_enabled": true,
+    "daily": null,
+    "weekly": null
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "group": "session",
+      "percent": 100,
+      "severity": "critical",
+      "resets_at": "2026-07-26T02:09:59.368138+00:00",
+      "scope": null,
+      "is_active": true
+    },
+    {
+      "kind": "weekly_all",
+      "group": "weekly",
+      "percent": 12,
+      "severity": "normal",
+      "resets_at": "2026-07-30T01:59:59.368154+00:00",
+      "scope": null,
+      "is_active": false
+    }
+  ],
+  "spend": {
+    "used": {
+      "amount_minor": 973,
+      "currency": "AUD",
+      "exponent": 2
+    },
+    "limit": null,
+    "percent": 0,
+    "severity": "normal",
+    "enabled": true,
+    "disabled_reason": null,
+    "cap": null,
+    "balance": null,
+    "auto_reload": null,
+    "disclaimer": "...",
+    "can_purchase_credits": false,
+    "can_toggle": false
+  },
+  "member_dashboard_available": false
+}
