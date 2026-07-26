@@ -30,9 +30,44 @@ if [[ ! -d "$REPO_DIR/frontend/node_modules" ]]; then
   exit 1
 fi
 
+BACKEND_PORT=8000
+
+# Bind-test the port the same way uvicorn will, so a conflict surfaces here as
+# a readable message instead of a buried traceback after both children start.
+port_is_busy() {
+  "$REPO_DIR/.venv/bin/python" - "$1" <<'PY'
+import socket
+import sys
+
+with socket.socket() as probe:
+    try:
+        probe.bind(("127.0.0.1", int(sys.argv[1])))
+    except OSError:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+if port_is_busy "$BACKEND_PORT"; then
+  holder=""
+  holder_pid="$(lsof -nP -iTCP:"$BACKEND_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$holder_pid" ]]; then
+    holder_cmd="$(ps -o comm= -p "$holder_pid" 2>/dev/null || true)"
+    if [[ -n "$holder_cmd" ]]; then
+      holder=" by ${holder_cmd##*/} (PID $holder_pid)"
+    else
+      holder=" (PID $holder_pid)"
+    fi
+  fi
+  echo "Port $BACKEND_PORT is already in use$holder."
+  echo "Quota Glass is probably already running. Open http://127.0.0.1:5173 to"
+  echo "use it, or stop that instance before starting another."
+  exit 1
+fi
+
 cd "$REPO_DIR"
 "$REPO_DIR/.venv/bin/python" -m uvicorn app.main:app \
-  --host 127.0.0.1 --port 8000 &
+  --host 127.0.0.1 --port "$BACKEND_PORT" &
 BACKEND_PID=$!
 
 cd "$REPO_DIR/frontend"
@@ -44,3 +79,21 @@ FRONTEND_PID=$!
 while kill -0 "$BACKEND_PID" 2>/dev/null && kill -0 "$FRONTEND_PID" 2>/dev/null; do
   sleep 1
 done
+
+# Exit with the dead child's status. Falling off the end here returns 0, which
+# makes a crashed backend look like a clean shutdown.
+status=0
+if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+  label="Backend"
+  wait "$BACKEND_PID" 2>/dev/null || status=$?
+  BACKEND_PID=""
+else
+  label="Frontend"
+  wait "$FRONTEND_PID" 2>/dev/null || status=$?
+  FRONTEND_PID=""
+fi
+
+if [[ "$status" -ne 0 ]]; then
+  echo "$label exited with status $status."
+fi
+exit "$status"
