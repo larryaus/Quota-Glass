@@ -499,6 +499,14 @@ def test_chatgpt_serves_cached_live_reading_during_backoff(tmp_path, fixture_dir
     assert state.oauth_backed_off is True
     assert "hung" in state.oauth_backoff_reason
     assert state.meters[0].used_pct == 18
+    assert state.oauth_cache_age_seconds == 5
+    # A frozen reading must not be alerted on, sampled, or drawn as live data.
+    assert state.meters[0].stale is True, (
+        "a cached reading served during backoff is not a fresh reading"
+    )
+    assert state.error is not None
+    assert "cached" in state.error
+    assert "hung" in state.error
 
 
 def test_chatgpt_live_disabled_keeps_local_mode(tmp_path, fixture_dir):

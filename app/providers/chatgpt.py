@@ -526,7 +526,29 @@ def parse_chatgpt(
     rate_limits, meters = reading
 
     local_usage, model_usage = _chatgpt_usage(Path(sessions_dir), current)
+    cache_age = live_cache.age_seconds(current)
     backed_off = live_cache.is_backed_off(current)
+    next_retry_at = (
+        _iso_datetime(live_cache.next_retry_at)
+        if live_cache.next_retry_at is not None
+        else None
+    )
+    error = None
+    if backed_off:
+        # The reading is frozen at whatever the last success saw. Marking it
+        # stale keeps alerting, history samples, and the card honest about
+        # that, exactly as the Claude OAuth path does.
+        for meter in meters:
+            meter.stale = True
+        error = (
+            "Codex CLI unavailable; showing cached live quota data "
+            "(%ds old). %s Next attempt at %s."
+            % (
+                cache_age or 0,
+                live_cache.backoff_reason,
+                next_retry_at,
+            )
+        )
     return ProviderState(
         key="chatgpt",
         label="ChatGPT",
@@ -534,16 +556,14 @@ def parse_chatgpt(
         meters=meters,
         credits=_live_credits(rate_limits),
         plan_type=rate_limits.get("planType"),
-        error=None,
+        error=error,
         last_updated=_iso_datetime(live_cache.fetched_at)
         if live_cache.fetched_at is not None
         else None,
         oauth_backed_off=backed_off,
         oauth_backoff_reason=live_cache.backoff_reason if backed_off else None,
-        oauth_cache_age_seconds=live_cache.age_seconds(current),
-        oauth_next_retry_at=_iso_datetime(live_cache.next_retry_at)
-        if backed_off and live_cache.next_retry_at is not None
-        else None,
+        oauth_cache_age_seconds=cache_age,
+        oauth_next_retry_at=next_retry_at if backed_off else None,
         local_usage=local_usage,
         model_usage=model_usage,
     )
