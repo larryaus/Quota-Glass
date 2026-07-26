@@ -48,7 +48,14 @@ class UsagePoller:
         )
 
     async def refresh(self) -> DashboardState:
-        await asyncio.to_thread(self._refresh_lock.acquire)
+        # Never queue for the lock. Waiting would park a thread-pool worker,
+        # and the holder needs workers of its own (parse_chatgpt, alerting,
+        # sample persistence); enough waiters and it can never finish, never
+        # release, and the poller never recovers. A caller that arrives
+        # mid-poll gets the current state and the in-flight result lands
+        # moments later; the background loop retries on its next interval.
+        if not self._refresh_lock.acquire(blocking=False):
+            return self.state()
         try:
             started = time.monotonic()
             self.health.running = True

@@ -147,7 +147,8 @@ does not have access to either provider's billing records.
 - `GET /api/state` — providers, meters, credits, errors, and poller health
 - `GET /api/history?hours=24` — sampled SQLite history
 - `GET /api/events?limit=50` — recent fired alerts
-- `POST /api/refresh` — immediate poll
+- `POST /api/refresh` — immediate poll; while one is already in flight it
+  returns the current state instead of queueing behind it
 - `GET /api/health` — lightweight process health
 
 ## Tests
