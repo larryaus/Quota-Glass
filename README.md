@@ -70,6 +70,10 @@ Set environment variables before running `./run.sh`:
 | `ALERT_RESET_PCT` | `5` | Low-water percentage that confirms `REFRESHED`. |
 | `STALE_AFTER_MINUTES` | `30` | Age after which a Codex snapshot is stale. |
 | `CHATGPT_CANDIDATE_FILES` | `5` | Recent rollout files compared by snapshot timestamp. |
+| `ENABLE_CHATGPT_LIVE` | `0` | Opt into live ChatGPT quota via the Codex CLI. |
+| `CHATGPT_LIVE_MIN_INTERVAL_SECONDS` | `300` | Minimum interval between Codex CLI usage reads. |
+| `CODEX_CLI_PATH` | `codex` | Path to the Codex CLI executable. |
+| `CODEX_CLI_TIMEOUT_SECONDS` | `20` | Timeout for a single Codex CLI read. |
 | `HISTORY_RETENTION_DAYS` | `30` | Retention period for SQLite samples and events. |
 | `MAX_NOTIFICATION_ATTEMPTS` | `3` | Delivery attempts allowed for each notification. |
 | `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | Injectable Codex rollout root. |
@@ -109,6 +113,27 @@ visible as stale OAuth data during backoff; only a provider that has never
 succeeded falls back to local-only estimates. With the default
 `ENABLE_CLAUDE_OAUTH=0`, Quota Glass makes no Claude network call and never
 attempts a Keychain read.
+
+## ChatGPT live quota opt-in
+
+Live ChatGPT percentages are **off by default**. When enabled, the backend runs
+`codex app-server` and calls its `account/rateLimits/read` JSON-RPC method,
+caching the result for at least five minutes by default:
+
+```bash
+ENABLE_CHATGPT_LIVE=1 ./run.sh
+```
+
+Quota Glass never reads `~/.codex/auth.json` and never handles Codex tokens.
+Authentication, token refresh, and request attestation stay inside the Codex
+CLI. This does mean the feature depends on the CLI being installed and logged
+in, and on `app-server` — an experimental interface — keeping its current shape.
+
+Any failure (CLI missing, logged out, timeout, or a protocol change) falls back
+to parsing Codex session files on disk, which is the default behaviour. A
+previously successful reading stays visible as a cached value during backoff.
+With `ENABLE_CHATGPT_LIVE=0`, no subprocess is spawned and no network call is
+made.
 
 ## Cost estimates and billing
 
