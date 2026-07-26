@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from app.providers import codex_cli
 from app.providers.codex_cli import (
     CodexCliProtocolError,
     CodexCliTimeout,
@@ -154,3 +155,42 @@ for line in sys.stdin:
         "expected the partial-line stall to time out near the configured "
         "deadline, but the call took %.2fs" % elapsed
     )
+
+
+def _write_all(fd, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def test_line_reader_reassembles_multibyte_char_split_across_chunk_boundary():
+    """A UTF-8 character whose bytes straddle a _READ_CHUNK_BYTES boundary
+    must come out intact, not as two U+FFFD replacement characters.
+
+    Decoding each os.read() chunk independently has no memory of a dangling
+    partial codepoint from the previous chunk, so a character split right at
+    the chunk boundary gets corrupted silently (json.loads happily accepts
+    U+FFFD, so this would not raise anywhere) instead of raising loudly.
+    """
+    read_fd, write_fd = os.pipe()
+    stream = os.fdopen(read_fd, "rb", buffering=0)
+    try:
+        # 'e with acute' is 0xC3 0xA9 in UTF-8. Place the first byte as the
+        # very last byte of the first _READ_CHUNK_BYTES-sized read, and the
+        # second byte as the first byte of the next read.
+        prefix = b"a" * (codex_cli._READ_CHUNK_BYTES - 1)
+        multibyte = "é".encode("utf-8")
+        payload = prefix + multibyte + b"tail\n"
+        _write_all(write_fd, payload)
+
+        reader = codex_cli._LineReader(stream)
+        deadline = time.monotonic() + 5
+        line = reader.read_line(deadline, request_id=1)
+
+        expected = "a" * (codex_cli._READ_CHUNK_BYTES - 1) + "é" + "tail\n"
+        assert line == expected
+        assert "�" not in line
+    finally:
+        os.close(write_fd)
+        stream.close()

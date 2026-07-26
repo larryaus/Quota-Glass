@@ -1,3 +1,4 @@
+import codecs
 import json
 import os
 import select
@@ -52,6 +53,13 @@ class _LineReader:
     def __init__(self, stream) -> None:
         self._fd = stream.fileno()
         self._buffer = ""
+        # A stateful incremental decoder carries a partial multi-byte
+        # codepoint across separate os.read() chunks. Decoding each chunk
+        # independently (e.g. chunk.decode("utf-8", errors="replace")) would
+        # split any character whose bytes straddle a chunk boundary into two
+        # invalid fragments, each silently replaced with U+FFFD instead of
+        # reassembling the original character.
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def read_line(self, deadline: float, request_id: int) -> str:
         """Return the next newline-terminated frame, or "" at EOF once
@@ -75,12 +83,15 @@ class _LineReader:
                 )
             chunk = os.read(self._fd, _READ_CHUNK_BYTES)
             if not chunk:
-                # EOF: hand back whatever partial data is left, if any, so
-                # the caller can try to parse it before deciding the stream
-                # is truly closed.
+                # EOF: flush any codepoint the decoder was still holding
+                # (an incomplete trailing sequence becomes U+FFFD here,
+                # rather than being silently dropped), then hand back
+                # whatever partial data is left so the caller can try to
+                # parse it before deciding the stream is truly closed.
+                self._buffer += self._decoder.decode(b"", final=True)
                 line, self._buffer = self._buffer, ""
                 return line
-            self._buffer += chunk.decode("utf-8", errors="replace")
+            self._buffer += self._decoder.decode(chunk)
 
 
 def _read_result(
