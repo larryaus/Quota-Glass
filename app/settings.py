@@ -47,6 +47,10 @@ class Settings:
         max_notification_attempts: Optional[int] = None,
         oauth_min_interval_seconds: Optional[int] = None,
         oauth_max_backoff_seconds: Optional[int] = None,
+        enable_chatgpt_live: Optional[bool] = None,
+        chatgpt_live_min_interval_seconds: Optional[int] = None,
+        codex_cli_path: Optional[str] = None,
+        codex_cli_timeout_seconds: Optional[int] = None,
     ) -> None:
         home = Path.home()
         self.enable_claude_oauth = (
@@ -125,4 +129,26 @@ class Settings:
             _int_env("OAUTH_MAX_BACKOFF_SECONDS", 3600)
             if oauth_max_backoff_seconds is None
             else oauth_max_backoff_seconds,
+        )
+        self.enable_chatgpt_live = (
+            _bool_env("ENABLE_CHATGPT_LIVE", False)
+            if enable_chatgpt_live is None
+            else enable_chatgpt_live
+        )
+        self.chatgpt_live_min_interval_seconds = max(
+            1,
+            _int_env("CHATGPT_LIVE_MIN_INTERVAL_SECONDS", 300)
+            if chatgpt_live_min_interval_seconds is None
+            else chatgpt_live_min_interval_seconds,
+        )
+        self.codex_cli_path = (
+            os.getenv("CODEX_CLI_PATH", "codex")
+            if codex_cli_path is None
+            else codex_cli_path
+        )
+        self.codex_cli_timeout_seconds = max(
+            1,
+            _int_env("CODEX_CLI_TIMEOUT_SECONDS", 20)
+            if codex_cli_timeout_seconds is None
+            else codex_cli_timeout_seconds,
         )
