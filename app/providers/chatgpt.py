@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 from datetime import timedelta
-from typing import Any, DefaultDict, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, DefaultDict, Dict, Iterator, List, Optional, Tuple
 
 from app.models import (
     Credits,
@@ -14,6 +14,8 @@ from app.models import (
     ModelUsageWindow,
     ProviderState,
 )
+from app.providers.codex_cli import CodexCliError, read_account_rate_limits
+from app.providers.live_cache import LiveSourceCache
 
 
 DEFAULT_CANDIDATE_FILE_COUNT = 5
@@ -29,6 +31,38 @@ USAGE_COMPONENTS: Tuple[str, ...] = (
     "output_tokens",
     "reasoning_output_tokens",
 )
+WINDOW_LABELS = {
+    "primary": "Primary limit",
+    "secondary": "Secondary limit",
+    "individual_limit": "Individual limit",
+}
+LIVE_WINDOW_KEYS: Tuple[Tuple[str, str], ...] = (
+    ("primary", "primary"),
+    ("secondary", "secondary"),
+    ("individualLimit", "individual_limit"),
+)
+
+
+def _clamp_percent(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return max(0.0, min(100.0, float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iso_datetime(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _parse_timestamp(value: Any) -> Optional[datetime]:
@@ -305,7 +339,7 @@ def _chatgpt_usage(
     return local_usage, model_usage
 
 
-def parse_chatgpt(
+def _parse_chatgpt_rollout(
     sessions_dir: Path,
     stale_after_minutes: int = 30,
     now: Optional[datetime] = None,
@@ -334,38 +368,18 @@ def parse_chatgpt(
         )
 
     meters: List[Meter] = []
-    labels = {
-        "primary": "Primary limit",
-        "secondary": "Secondary limit",
-        "individual_limit": "Individual limit",
-    }
     for window_key in ("primary", "secondary", "individual_limit"):
         window = rate_limits.get(window_key)
         if not isinstance(window, dict):
             continue
-        raw_pct = window.get("used_percent")
-        try:
-            used_pct = None if raw_pct is None else max(0.0, min(100.0, float(raw_pct)))
-        except (TypeError, ValueError):
-            used_pct = None
-        raw_minutes = window.get("window_minutes")
-        raw_reset = window.get("resets_at")
-        try:
-            window_minutes = None if raw_minutes is None else int(raw_minutes)
-        except (TypeError, ValueError):
-            window_minutes = None
-        try:
-            resets_at = None if raw_reset is None else int(raw_reset)
-        except (TypeError, ValueError):
-            resets_at = None
         meters.append(
             Meter(
                 key="chatgpt.%s" % window_key,
                 provider="chatgpt",
-                label=labels[window_key],
-                used_pct=used_pct,
-                window_minutes=window_minutes,
-                resets_at=resets_at,
+                label=WINDOW_LABELS[window_key],
+                used_pct=_clamp_percent(window.get("used_percent")),
+                window_minutes=_optional_int(window.get("window_minutes")),
+                resets_at=_optional_int(window.get("resets_at")),
                 has_quota=True,
                 source="rollout",
                 stale=stale,
@@ -393,6 +407,113 @@ def parse_chatgpt(
         plan_type=rate_limits.get("plan_type"),
         error=error,
         last_updated=timestamp_text if isinstance(timestamp_text, str) else None,
+        local_usage=local_usage,
+        model_usage=model_usage,
+    )
+
+
+def _live_meters(rate_limits: JsonDict) -> List[Meter]:
+    meters: List[Meter] = []
+    for source_key, meter_suffix in LIVE_WINDOW_KEYS:
+        window = rate_limits.get(source_key)
+        if not isinstance(window, dict):
+            continue
+        meters.append(
+            Meter(
+                key="chatgpt.%s" % meter_suffix,
+                provider="chatgpt",
+                label=WINDOW_LABELS[meter_suffix],
+                used_pct=_clamp_percent(window.get("usedPercent")),
+                window_minutes=_optional_int(window.get("windowDurationMins")),
+                resets_at=_optional_int(window.get("resetsAt")),
+                has_quota=True,
+                source="app-server",
+                stale=False,
+            )
+        )
+    return meters
+
+
+def _live_credits(rate_limits: JsonDict) -> Credits:
+    raw = rate_limits.get("credits")
+    if not isinstance(raw, dict):
+        raw = {}
+    return Credits(
+        has_credits=bool(raw.get("hasCredits", False)),
+        unlimited=bool(raw.get("unlimited", False)),
+        balance=str(raw.get("balance", "0")),
+        spend_limit_reached=bool(rate_limits.get("spendControlReached", False)),
+    )
+
+
+def parse_chatgpt(
+    sessions_dir: Path,
+    stale_after_minutes: int = 30,
+    now: Optional[datetime] = None,
+    candidate_file_count: int = DEFAULT_CANDIDATE_FILE_COUNT,
+    enable_live: bool = False,
+    live_cache: Optional[LiveSourceCache] = None,
+    cli_path: str = "codex",
+    cli_timeout_seconds: int = 20,
+    live_reader: Optional[Callable[[str, int], Dict[str, Any]]] = None,
+) -> ProviderState:
+    if not enable_live or live_cache is None:
+        return _parse_chatgpt_rollout(
+            sessions_dir,
+            stale_after_minutes,
+            now,
+            candidate_file_count,
+        )
+
+    reader = live_reader or read_account_rate_limits
+    current = now or datetime.now(timezone.utc)
+    if live_cache.should_attempt(current):
+        try:
+            payload = reader(cli_path, cli_timeout_seconds)
+            live_cache.record_success(payload, current)
+        except CodexCliError as exc:
+            live_cache.record_failure(exc, current)
+        except Exception as exc:  # noqa: BLE001 - never let the poller die
+            live_cache.record_failure(exc, current)
+
+    payload = live_cache.payload
+    if payload is None:
+        # Never succeeded: a rollout reading beats no reading at all.
+        return _parse_chatgpt_rollout(
+            sessions_dir,
+            stale_after_minutes,
+            now,
+            candidate_file_count,
+        )
+
+    rate_limits = payload.get("rateLimits")
+    if not isinstance(rate_limits, dict):
+        return _parse_chatgpt_rollout(
+            sessions_dir,
+            stale_after_minutes,
+            now,
+            candidate_file_count,
+        )
+
+    local_usage, model_usage = _chatgpt_usage(Path(sessions_dir), current)
+    backed_off = live_cache.is_backed_off(current)
+    return ProviderState(
+        key="chatgpt",
+        label="ChatGPT",
+        mode="oauth",
+        meters=_live_meters(rate_limits),
+        credits=_live_credits(rate_limits),
+        plan_type=rate_limits.get("planType"),
+        error=None,
+        last_updated=_iso_datetime(live_cache.fetched_at)
+        if live_cache.fetched_at is not None
+        else None,
+        oauth_backed_off=backed_off,
+        oauth_backoff_reason=live_cache.backoff_reason if backed_off else None,
+        oauth_cache_age_seconds=live_cache.age_seconds(current),
+        oauth_next_retry_at=_iso_datetime(live_cache.next_retry_at)
+        if backed_off and live_cache.next_retry_at is not None
+        else None,
         local_usage=local_usage,
         model_usage=model_usage,
     )
