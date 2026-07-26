@@ -425,6 +425,8 @@ def test_chatgpt_live_meters_use_rollout_meter_keys(tmp_path, fixture_dir):
 
     assert state.mode == "oauth"
     assert state.plan_type == "plus"
+    assert state.error is None
+    assert state.oauth_backed_off is False
     keys = [meter.key for meter in state.meters]
     assert keys == ["chatgpt.primary"]
     meter = state.meters[0]
