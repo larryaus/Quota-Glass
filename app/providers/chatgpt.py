@@ -17,6 +17,7 @@ from app.models import (
 
 
 DEFAULT_CANDIDATE_FILE_COUNT = 5
+MAX_SCAN_MULTIPLIER = 10
 FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 60
 USAGE_WINDOWS: Tuple[Tuple[str, int], ...] = (
     ("Last 5 hours", 300),
@@ -97,16 +98,20 @@ def _latest_snapshot(
 ) -> Optional[JsonDict]:
     if not root.exists():
         return None
+    wanted = max(1, candidate_file_count)
     paths = sorted(
         root.glob("*/*/*/rollout-*.jsonl"),
         key=_file_mtime,
         reverse=True,
-    )[:max(1, candidate_file_count)]
+    )[: wanted * MAX_SCAN_MULTIPLIER]
     candidates: List[Tuple[JsonDict, Optional[datetime]]] = []
     for path in paths:
         record = _latest_usable_snapshot(path)
-        if record is not None:
-            candidates.append((record, _parse_timestamp(record.get("timestamp"))))
+        if record is None:
+            continue
+        candidates.append((record, _parse_timestamp(record.get("timestamp"))))
+        if len(candidates) >= wanted:
+            break
     timestamped = [candidate for candidate in candidates if candidate[1] is not None]
     if timestamped:
         return max(

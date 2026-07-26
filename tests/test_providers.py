@@ -785,3 +785,43 @@ async def test_claude_oauth_still_polls_when_local_parser_fails(
 
     assert state.mode == "oauth"
     assert state.meters[0].used_pct == 75
+
+
+def test_latest_snapshot_skips_files_without_rate_limits(tmp_path):
+    from app.providers.chatgpt import _latest_snapshot
+
+    sessions = tmp_path / "sessions" / "2026" / "07" / "26"
+    sessions.mkdir(parents=True)
+
+    def write(name, mtime, with_limits):
+        path = sessions / ("rollout-%s.jsonl" % name)
+        records = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-26T04:00:00Z",
+                "payload": {"type": "agent_message", "message": "x"},
+            }
+        ]
+        if with_limits:
+            records.append(
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-07-26T00:00:00Z",
+                    "payload": {
+                        "type": "token_count",
+                        "rate_limits": {"primary": {"used_percent": 42}},
+                        "info": {},
+                    },
+                }
+            )
+        path.write_text("\n".join(json.dumps(r) for r in records))
+        os.utime(path, (mtime, mtime))
+
+    for index in range(5):
+        write("recent-%d" % index, 2000 + index, with_limits=False)
+    write("older-with-limits", 1000, with_limits=True)
+
+    snapshot = _latest_snapshot(tmp_path / "sessions", 5)
+
+    assert snapshot is not None
+    assert snapshot["payload"]["rate_limits"]["primary"]["used_percent"] == 42
