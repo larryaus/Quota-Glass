@@ -17,7 +17,7 @@
 - **`ENABLE_CHATGPT_LIVE` defaults to `0`.** No subprocess spawn or network call in default behaviour.
 - **Never log or persist Codex response bodies or any part of `~/.codex/auth.json`.**
 - Run the full suite with `.venv/bin/python -m pytest -q` from the repo root.
-- **Test-count baseline is 60 passing tests** (at commit `b30a25e`). Each task states the expected running total: 61, 66, 71, 74, 78, 80. A different starting count means the baseline moved — recompute rather than assuming a regression.
+- **Test-count baseline is 60 passing tests** (at commit `b30a25e`). Each task states the expected running total: 61, 67, 72, 75, 79, 81. A different starting count means the baseline moved — recompute rather than assuming a regression.
 
 ---
 
@@ -309,7 +309,12 @@ class LiveSourceCache:
         exc: Exception,
         current: datetime,
     ) -> Tuple[int, str]:
-        """Return (delay_seconds, reason). Subclasses refine this."""
+        """Return (delay_seconds, reason).
+
+        Owns its own failure counting: a subclass may decide some failures
+        should not escalate the backoff at all.
+        """
+        self._consecutive_failures += 1
         delay = self._exponential_backoff_seconds()
         return delay, "%s request failed: %s" % (self.label, exc)
 
@@ -318,11 +323,16 @@ class LiveSourceCache:
         exc: Exception,
         current: datetime,
     ) -> None:
-        self._consecutive_failures += 1
         delay, reason = self._classify_failure(exc, current)
         self.backoff_reason = reason
         self.next_retry_at = current + timedelta(seconds=delay)
 ```
+
+**Why `_classify_failure` counts rather than `record_failure`:** the Claude
+subclass escalates backoff only for HTTP 429 and leaves the counter untouched
+for other failures. If the base class incremented unconditionally, the sequence
+`429, 429, non-429, 429` would produce a different delay than today's code
+does. No existing test covers that mix, so the regression would be silent.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -356,13 +366,14 @@ class ClaudeOAuthCache(LiveSourceCache):
             and exc.response.status_code == 429
         )
         if not is_rate_limit:
-            # Non-429 failures retry at the floor interval, matching the
-            # behaviour this class had before the base class existed.
-            self._consecutive_failures = 0
+            # Non-429 failures retry at the floor interval and must NOT touch
+            # the counter, matching the behaviour this class had before the
+            # base class existed.
             return (
                 self.min_interval_seconds,
                 "Claude OAuth request failed: %s" % exc,
             )
+        self._consecutive_failures += 1
         retry_after = _retry_after_seconds(exc, current)
         if retry_after is None:
             delay = self._exponential_backoff_seconds()
@@ -379,10 +390,49 @@ class ClaudeOAuthCache(LiveSourceCache):
 
 Confirm `Tuple` is in the `typing` import list in `claude.py`.
 
+Then add this regression test to `tests/test_live_cache.py`. It pins the
+counting rule that the refactor could silently break — no existing test mixes
+non-429 failures into a 429 sequence:
+
+```python
+def test_claude_non_rate_limit_failure_does_not_escalate_backoff():
+    import httpx
+
+    from app.providers.claude import ClaudeOAuthCache
+
+    cache = ClaudeOAuthCache(min_interval_seconds=300, max_backoff_seconds=3600)
+    current = _now()
+
+    def rate_limited():
+        response = httpx.Response(
+            429,
+            request=httpx.Request("GET", "https://example.test"),
+        )
+        return httpx.HTTPStatusError(
+            "429",
+            request=response.request,
+            response=response,
+        )
+
+    cache.record_failure(rate_limited(), current)
+    first = (cache.next_retry_at - current).total_seconds()
+    cache.record_failure(rate_limited(), current)
+    second = (cache.next_retry_at - current).total_seconds()
+    cache.record_failure(RuntimeError("network down"), current)
+    plain = (cache.next_retry_at - current).total_seconds()
+    cache.record_failure(rate_limited(), current)
+    third = (cache.next_retry_at - current).total_seconds()
+
+    assert first == 300
+    assert second == 600
+    assert plain == 300, "a non-429 failure retries at the floor interval"
+    assert third == 1200, "a non-429 failure must not reset 429 escalation"
+```
+
 - [ ] **Step 6: Run the full suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: PASS — 66 passed. `tests/test_claude_oauth_cache.py` must be green **without edits**; if it fails, the refactor changed Claude behaviour and must be corrected, not the test.
+Expected: PASS — 67 passed. `tests/test_claude_oauth_cache.py` must be green **without edits**; if it fails, the refactor changed Claude behaviour and must be corrected, not the test.
 
 - [ ] **Step 7: Commit**
 
@@ -1141,7 +1191,7 @@ introduces no cycle.
 - [ ] **Step 7: Run the full suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: PASS — 78 passed. Every pre-existing ChatGPT test must stay green untouched, since `enable_live` defaults to `False`.
+Expected: PASS — 79 passed. Every pre-existing ChatGPT test must stay green untouched, since `enable_live` defaults to `False`.
 
 - [ ] **Step 8: Commit**
 
@@ -1265,7 +1315,7 @@ Extend the `parse_chatgpt` call (lines 56-61):
 - [ ] **Step 4: Run the full suite**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: PASS — 80 passed.
+Expected: PASS — 81 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1439,7 +1489,7 @@ Everything above is offline. This task confirms the feature works against the ac
 - [ ] **Step 1: Confirm the full suite passes**
 
 Run: `.venv/bin/python -m pytest -q`
-Expected: PASS — 80 passed.
+Expected: PASS — 81 passed.
 
 - [ ] **Step 2: Read live limits through the real CLI**
 
