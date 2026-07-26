@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -118,3 +119,38 @@ sys.stdout.flush()
 
     with pytest.raises((CodexCliProtocolError, CodexCliTimeout)):
         read_account_rate_limits(cli, timeout_seconds=3)
+
+
+def test_partial_line_stall_times_out_promptly(tmp_path):
+    """A peer that writes a partial (unterminated) line and then stalls must
+    still be bounded by the deadline, not left to block on readline()."""
+    body = """
+import json, sys, time
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    if message["method"] == "initialize":
+        result = {"userAgent": "fake", "codexHome": "/tmp"}
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\\n")
+        sys.stdout.flush()
+    else:
+        sys.stdout.write('{"jsonrpc": "2.0", "id": 2, "resu')
+        sys.stdout.flush()
+        time.sleep(30)
+"""
+    cli = _write_fake_cli(tmp_path, body)
+
+    start = time.monotonic()
+    with pytest.raises(CodexCliTimeout):
+        read_account_rate_limits(cli, timeout_seconds=2)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5, (
+        "expected the partial-line stall to time out near the configured "
+        "deadline, but the call took %.2fs" % elapsed
+    )

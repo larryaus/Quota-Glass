@@ -1,14 +1,16 @@
 import json
+import os
 import select
 import subprocess
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 CLIENT_NAME = "quota-glass"
 CLIENT_VERSION = "1.0.0"
 INITIALIZE_ID = 1
 RATE_LIMITS_ID = 2
 RATE_LIMITS_METHOD = "account/rateLimits/read"
+_READ_CHUNK_BYTES = 4096
 
 
 class CodexCliError(Exception):
@@ -34,25 +36,60 @@ def _send(process: subprocess.Popen, message: Dict[str, Any]) -> None:
     process.stdin.flush()
 
 
+class _LineReader:
+    """Assembles newline-delimited frames from a pipe without ever blocking
+    past a caller-supplied deadline.
+
+    `select()` on a stream only guarantees that *some* bytes are available,
+    not a full line. `TextIOWrapper.readline()` can consume a partial line
+    into its own internal buffer and then block waiting for the rest,
+    bypassing the deadline entirely if the peer stalls mid-line. Reading raw
+    bytes off the file descriptor ourselves means every wait for more data
+    goes back through `select()` with the remaining time, so a peer that
+    writes a partial line and then stalls is still bounded by the deadline.
+    """
+
+    def __init__(self, stream) -> None:
+        self._fd = stream.fileno()
+        self._buffer = ""
+
+    def read_line(self, deadline: float, request_id: int) -> str:
+        """Return the next newline-terminated frame, or "" at EOF once
+        nothing remains buffered. Raises CodexCliTimeout if the deadline
+        passes before a full line (or EOF) becomes available."""
+        while True:
+            newline_at = self._buffer.find("\n")
+            if newline_at != -1:
+                line = self._buffer[: newline_at + 1]
+                self._buffer = self._buffer[newline_at + 1 :]
+                return line
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CodexCliTimeout(
+                    "codex app-server did not answer request %d in time" % request_id
+                )
+            ready, _, _ = select.select([self._fd], [], [], remaining)
+            if not ready:
+                raise CodexCliTimeout(
+                    "codex app-server did not answer request %d in time" % request_id
+                )
+            chunk = os.read(self._fd, _READ_CHUNK_BYTES)
+            if not chunk:
+                # EOF: hand back whatever partial data is left, if any, so
+                # the caller can try to parse it before deciding the stream
+                # is truly closed.
+                line, self._buffer = self._buffer, ""
+                return line
+            self._buffer += chunk.decode("utf-8", errors="replace")
+
+
 def _read_result(
-    process: subprocess.Popen,
+    reader: "_LineReader",
     request_id: int,
     deadline: float,
 ) -> Dict[str, Any]:
-    if process.stdout is None:
-        raise CodexCliProtocolError("codex app-server has no stdout")
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise CodexCliTimeout(
-                "codex app-server did not answer request %d in time" % request_id
-            )
-        ready, _, _ = select.select([process.stdout], [], [], remaining)
-        if not ready:
-            raise CodexCliTimeout(
-                "codex app-server did not answer request %d in time" % request_id
-            )
-        line = process.stdout.readline()
+        line = reader.read_line(deadline, request_id)
         if not line:
             raise CodexCliProtocolError("codex app-server closed its output stream")
         try:
@@ -117,6 +154,9 @@ def read_account_rate_limits(
     except OSError as exc:
         raise CodexCliUnavailable("cannot run %s app-server: %s" % (cli_path, exc))
     try:
+        if process.stdout is None:
+            raise CodexCliProtocolError("codex app-server has no stdout")
+        reader = _LineReader(process.stdout)
         _send(
             process,
             {
@@ -132,7 +172,7 @@ def read_account_rate_limits(
                 },
             },
         )
-        _read_result(process, INITIALIZE_ID, deadline)
+        _read_result(reader, INITIALIZE_ID, deadline)
         _send(process, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
         _send(
             process,
@@ -143,7 +183,7 @@ def read_account_rate_limits(
                 "params": {},
             },
         )
-        return _read_result(process, RATE_LIMITS_ID, deadline)
+        return _read_result(reader, RATE_LIMITS_ID, deadline)
     except BrokenPipeError as exc:
         raise CodexCliUnavailable("codex app-server exited early: %s" % exc)
     finally:
