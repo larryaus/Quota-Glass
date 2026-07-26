@@ -52,22 +52,30 @@ sys.exit(1)
 PY
 }
 
-if port_is_busy "$BACKEND_PORT"; then
-  holder=""
-  holder_pid="$(lsof -nP -iTCP:"$BACKEND_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true)"
-  if [[ -n "$holder_pid" ]]; then
-    holder_cmd="$(ps -o comm= -p "$holder_pid" 2>/dev/null || true)"
-    if [[ -n "$holder_cmd" ]]; then
-      holder=" by ${holder_cmd##*/} (PID $holder_pid)"
-    else
-      holder=" (PID $holder_pid)"
-    fi
+# Name the process listening on a port, so the conflict message says which
+# one to stop instead of leaving the user to hunt for it.
+port_holder() {
+  local holder_pid holder_cmd
+  holder_pid="$(lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true)"
+  [[ -n "$holder_pid" ]] || return 0
+  holder_cmd="$(ps -o comm= -p "$holder_pid" 2>/dev/null || true)"
+  if [[ -n "$holder_cmd" ]]; then
+    printf ' by %s (PID %s)' "${holder_cmd##*/}" "$holder_pid"
+  else
+    printf ' (PID %s)' "$holder_pid"
   fi
-  echo "Port $BACKEND_PORT is already in use$holder."
+}
+
+# Non-zero (after explaining why) when the backend port cannot be used.
+preflight_backend_port() {
+  port_is_busy "$1" || return 0
+  echo "Port $1 is already in use$(port_holder "$1")."
   echo "Quota Glass is probably already running. Open http://127.0.0.1:5173 to"
   echo "use it, or stop that instance before starting another."
-  exit 1
-fi
+  return 1
+}
+
+preflight_backend_port "$BACKEND_PORT" || exit 1
 
 cd "$REPO_DIR"
 "$REPO_DIR/.venv/bin/python" -m uvicorn app.main:app \
