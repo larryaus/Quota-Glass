@@ -246,3 +246,58 @@ async def test_chatgpt_keeps_polling_while_claude_oauth_is_cached(
     assert len(chatgpt_calls) == 2
     assert len(keychain_reads) == 1
     assert oauth_calls == ["token"]
+
+
+@pytest.mark.asyncio
+async def test_poller_passes_live_settings_to_chatgpt(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_chatgpt(*args, **kwargs):
+        captured.update(kwargs)
+        return ProviderState(key="chatgpt", label="ChatGPT", mode="local")
+
+    async def working_claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", fake_chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", working_claude)
+    settings = poller_settings(
+        tmp_path,
+        enable_chatgpt_live=True,
+        codex_cli_path="/fake/codex",
+        codex_cli_timeout_seconds=9,
+    )
+    database = Database(settings.database_path)
+    alerts = AlertEngine(database, NullNotifier())
+    poller = UsagePoller(settings, database, alerts)
+
+    await poller.refresh()
+
+    assert captured["enable_live"] is True
+    assert captured["cli_path"] == "/fake/codex"
+    assert captured["cli_timeout_seconds"] == 9
+    assert captured["live_cache"] is poller._chatgpt_live_cache
+
+
+@pytest.mark.asyncio
+async def test_live_cache_survives_across_polls(monkeypatch, tmp_path):
+    seen = []
+
+    def fake_chatgpt(*args, **kwargs):
+        seen.append(kwargs["live_cache"])
+        return ProviderState(key="chatgpt", label="ChatGPT", mode="local")
+
+    async def working_claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", fake_chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", working_claude)
+    settings = poller_settings(tmp_path, enable_chatgpt_live=True)
+    database = Database(settings.database_path)
+    alerts = AlertEngine(database, NullNotifier())
+    poller = UsagePoller(settings, database, alerts)
+
+    await poller.refresh()
+    await poller.refresh()
+
+    assert seen[0] is seen[1], "cache must persist so backoff state is not lost"
