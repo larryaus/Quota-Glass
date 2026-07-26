@@ -458,6 +458,37 @@ def test_chatgpt_falls_back_to_rollout_when_live_fails(tmp_path, fixture_dir):
     assert state.mode == "local"
     assert state.meters, "rollout meters must still render when live fails"
     assert state.meters[0].source == "rollout"
+    # The user has already enabled the live source, so the card must show the
+    # backoff banner rather than the note asking them to enable it.
+    assert state.oauth_backed_off is True
+    assert state.oauth_backoff_reason is not None
+    assert "not logged in" in state.oauth_backoff_reason
+    assert state.oauth_next_retry_at is not None
+    assert state.error is not None
+    assert "not logged in" in state.error
+
+
+def test_chatgpt_live_failure_keeps_the_rollout_error_visible(tmp_path):
+    """A live failure annotates the rollout state; it must not erase it."""
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.codex_cli import CodexCliUnavailable
+    from app.providers.live_cache import LiveSourceCache
+
+    def failing_reader(cli_path, timeout_seconds):
+        raise CodexCliUnavailable("codex is not installed")
+
+    state = parse_chatgpt(
+        tmp_path,
+        enable_live=True,
+        live_cache=LiveSourceCache("Codex CLI"),
+        live_reader=failing_reader,
+    )
+
+    assert state.mode == "local"
+    assert state.meters == []
+    assert "No Codex session usage snapshots found." in state.error
+    assert "codex is not installed" in state.error
+    assert state.oauth_backed_off is True
 
 
 def test_chatgpt_serves_cached_live_reading_during_backoff(tmp_path, fixture_dir):

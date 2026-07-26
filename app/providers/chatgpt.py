@@ -507,6 +507,14 @@ def parse_chatgpt(
         except Exception as exc:  # noqa: BLE001 - never let the poller die
             live_cache.record_failure(exc, current)
 
+    cache_age = live_cache.age_seconds(current)
+    backed_off = live_cache.is_backed_off(current)
+    next_retry_at = (
+        _iso_datetime(live_cache.next_retry_at)
+        if live_cache.next_retry_at is not None
+        else None
+    )
+
     reading: Optional[Tuple[JsonDict, List[Meter]]] = None
     if live_cache.payload is not None and live_cache.fetched_at is not None:
         try:
@@ -516,23 +524,33 @@ def parse_chatgpt(
             # this only fires if a payload was injected past that guard.
             reading = None
     if reading is None:
-        # Never succeeded: a rollout reading beats no reading at all.
-        return _parse_chatgpt_rollout(
+        # Never succeeded: a rollout reading beats no reading at all. The live
+        # state travels with it so the card can explain the degradation
+        # instead of inviting the user to enable an already-enabled source.
+        rollout = _parse_chatgpt_rollout(
             sessions_dir,
             stale_after_minutes,
             now,
             candidate_file_count,
         )
+        reason = live_cache.backoff_reason or "No successful Codex CLI response."
+        live_error = (
+            "Codex CLI unavailable; showing Codex session snapshots: %s" % reason
+        )
+        if next_retry_at is not None:
+            live_error = "%s Next attempt at %s." % (live_error, next_retry_at)
+        rollout.error = (
+            "%s %s" % (rollout.error, live_error)
+            if rollout.error
+            else live_error
+        )
+        rollout.oauth_backed_off = backed_off
+        rollout.oauth_backoff_reason = reason
+        rollout.oauth_next_retry_at = next_retry_at
+        return rollout
     rate_limits, meters = reading
 
     local_usage, model_usage = _chatgpt_usage(Path(sessions_dir), current)
-    cache_age = live_cache.age_seconds(current)
-    backed_off = live_cache.is_backed_off(current)
-    next_retry_at = (
-        _iso_datetime(live_cache.next_retry_at)
-        if live_cache.next_retry_at is not None
-        else None
-    )
     error = None
     if backed_off:
         # The reading is frozen at whatever the last success saw. Marking it
