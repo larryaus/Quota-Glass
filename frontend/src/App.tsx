@@ -24,15 +24,24 @@ type LocalUsage = {
   estimated_cost_usd: number | null;
 };
 
+type EffortUsage = {
+  effort: string;
+  tokens: number;
+  percentage: number;
+};
+
+type ModelUsage = {
+  model: string;
+  tokens: number;
+  percentage: number;
+  efforts: EffortUsage[];
+};
+
 type ModelUsageWindow = {
   label: string;
   window_minutes: number | null;
   total_tokens: number;
-  models: {
-    model: string;
-    tokens: number;
-    percentage: number;
-  }[];
+  models: ModelUsage[];
 };
 
 type Provider = {
@@ -83,6 +92,9 @@ type AlertEvent = {
   used_pct: number | null;
   created_at: number;
 };
+
+// Matches app/providers/usage.py: the label for records that named no effort.
+const UNSPECIFIED_EFFORT = "unspecified";
 
 function timeAgo(value: string | null): string {
   if (!value) return "waiting for data";
@@ -248,7 +260,95 @@ function LocalUsageCard({
   );
 }
 
+type EffortSlice = EffortUsage & {
+  // Width as a share of the whole window, so segments stack into the model bar.
+  width: number;
+  color: string;
+};
+
+// Each effort is a flat sample of the same green-to-amber ramp the solid bars
+// use, taken at the segment's midpoint, so a legend dot and its bar segment are
+// always the same colour.
+function effortSlices(model: ModelUsage): EffortSlice[] {
+  let consumed = 0;
+  return (model.efforts ?? []).map((effort) => {
+    const share = effort.percentage / 100;
+    const midpoint = Math.min(1, consumed + share / 2);
+    consumed += share;
+    return {
+      ...effort,
+      width: model.percentage * share,
+      color: `color-mix(in srgb, var(--green), var(--amber) ${(
+        midpoint * 100
+      ).toFixed(1)}%)`,
+    };
+  });
+}
+
+function effortSummary(efforts: EffortUsage[]): string {
+  return efforts
+    .map((effort) => `${effort.effort} ${effort.percentage.toFixed(1)} percent`)
+    .join(", ");
+}
+
+function ModelRow({ model }: { model: ModelUsage }) {
+  // A model whose records never named an effort keeps the plain bar it always
+  // had: a lone "unspecified 100%" row would be noise, not detail.
+  const efforts = model.efforts ?? [];
+  const detailed = efforts.some((effort) => effort.effort !== UNSPECIFIED_EFFORT);
+  const slices = detailed ? effortSlices(model) : [];
+  const share = `${model.percentage.toFixed(1)} percent`;
+
+  return (
+    <li>
+      <div className="model-row">
+        <strong title={model.model}>{model.model}</strong>
+        <span>{model.percentage.toFixed(1)}%</span>
+      </div>
+      <div
+        className="model-bar"
+        role="img"
+        aria-label={
+          detailed
+            ? `${model.model}: ${share}, split by effort ${effortSummary(efforts)}`
+            : `${model.model}: ${share}`
+        }
+      >
+        {detailed ? (
+          slices.map((slice) => (
+            <span
+              key={slice.effort}
+              className="model-bar-segment"
+              style={{ width: `${slice.width}%`, background: slice.color }}
+            />
+          ))
+        ) : (
+          <span style={{ width: `${model.percentage}%` }} />
+        )}
+      </div>
+      <small>{model.tokens.toLocaleString()} tokens</small>
+      {detailed && (
+        <ul className="effort-list">
+          {slices.map((slice) => (
+            <li key={slice.effort}>
+              <span className="effort-swatch" style={{ background: slice.color }} />
+              <span className="effort-name" title={slice.effort}>
+                {slice.effort}
+              </span>
+              <span className="effort-share">{slice.percentage.toFixed(1)}%</span>
+              <span className="effort-tokens">{slice.tokens.toLocaleString()}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
 function ModelUsageCard({ usage }: { usage: ModelUsageWindow }) {
+  const hasEffortDetail = usage.models.some((model) =>
+    (model.efforts ?? []).some((effort) => effort.effort !== UNSPECIFIED_EFFORT),
+  );
   return (
     <article className="model-card">
       <header>
@@ -263,24 +363,14 @@ function ModelUsageCard({ usage }: { usage: ModelUsageWindow }) {
       ) : (
         <ol className="model-list">
           {usage.models.map((model) => (
-            <li key={model.model}>
-              <div className="model-row">
-                <strong title={model.model}>{model.model}</strong>
-                <span>{model.percentage.toFixed(1)}%</span>
-              </div>
-              <div
-                className="model-bar"
-                role="img"
-                aria-label={`${model.model}: ${model.percentage.toFixed(1)} percent`}
-              >
-                <span style={{ width: `${model.percentage}%` }} />
-              </div>
-              <small>{model.tokens.toLocaleString()} tokens</small>
-            </li>
+            <ModelRow key={model.model} model={model} />
           ))}
         </ol>
       )}
-      <footer>{usage.total_tokens.toLocaleString()} attributed tokens</footer>
+      <footer>
+        {usage.total_tokens.toLocaleString()} attributed tokens
+        {hasEffortDetail && " · effort percentages are per model"}
+      </footer>
     </article>
   );
 }

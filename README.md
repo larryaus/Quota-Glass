@@ -2,8 +2,8 @@
 
 Quota Glass is a private, single-user macOS dashboard for Claude and ChatGPT
 subscription usage. A React frontend displays quota gauges, refresh countdowns,
-local token estimates, model-by-model token percentages, credits, provider
-errors, and recent alert events.
+local token estimates, model-by-model token percentages split by effort level,
+credits, provider errors, and recent alert events.
 A FastAPI process reads local usage files, persists samples and alert state in
 SQLite, and uses built-in `osascript` notifications when a quota is exhausted
 and when it refreshes.
@@ -16,12 +16,19 @@ Everything runs locally. No API key or vendor billing organization is needed.
   `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. The percentage comes directly
   from Codex's local rate-limit snapshot. Because Codex only updates it during a
   turn, readings older than 30 minutes are marked stale and never alert. Model
-  mix is calculated from each turn's token delta and active rollout model.
+  mix is calculated from each turn's token delta and the active rollout model
+  and reasoning effort.
 - **Claude (default):** reads assistant usage records under
   `~/.claude/projects/**/*.jsonl` and aggregates rolling 5-hour and 7-day token
-  totals and model mix. These local records do not contain subscription quota
-  percentages, so the dashboard labels them as estimates and never alerts on
-  them.
+  totals and model mix, split by the effort recorded on each assistant turn.
+  These local records do not contain subscription quota percentages, so the
+  dashboard labels them as estimates and never alerts on them.
+
+Both providers report the 5-hour and 7-day model mix as a per-model effort
+breakdown: model percentages are shares of the window, and effort percentages
+are shares of their own model. Effort is only ever read from the local record —
+turns whose records name no effort are grouped under `unspecified` rather than
+being assigned a guess.
 
 The SQLite database is created at `./data/usage.db`. Alert latches survive app
 restarts, preventing duplicate notifications.

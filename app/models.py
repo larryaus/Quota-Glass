@@ -36,10 +36,18 @@ class LocalUsageWindow(BaseModel):
     estimated_cost_usd: Optional[float] = None
 
 
+class EffortUsage(BaseModel):
+    effort: str
+    tokens: int
+    # Share of the parent model's tokens in the window, not of the window.
+    percentage: float
+
+
 class ModelUsage(BaseModel):
     model: str
     tokens: int
     percentage: float
+    efforts: List[EffortUsage] = Field(default_factory=list)
 
 
 class ModelUsageWindow(BaseModel):

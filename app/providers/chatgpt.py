@@ -11,7 +11,6 @@ from app.models import (
     JsonDict,
     LocalUsageWindow,
     Meter,
-    ModelUsage,
     ModelUsageWindow,
     ProviderState,
 )
@@ -21,6 +20,11 @@ from app.providers.codex_cli import (
     read_account_rate_limits,
 )
 from app.providers.live_cache import LiveSourceCache
+from app.providers.usage import (
+    UNSPECIFIED_EFFORT,
+    model_usage_window,
+    normalize_effort,
+)
 
 
 DEFAULT_CANDIDATE_FILE_COUNT = 5
@@ -204,30 +208,18 @@ def _usage_breakdown(value: Any) -> Dict[str, int]:
     return breakdown
 
 
-def _model_usage_window(
-    label: str,
-    window_minutes: int,
-    counts: Dict[str, int],
-) -> ModelUsageWindow:
-    total = sum(counts.values())
-    models = [
-        ModelUsage(
-            model=model,
-            tokens=tokens,
-            percentage=round(tokens * 100.0 / total, 1) if total else 0.0,
-        )
-        for model, tokens in sorted(
-            counts.items(),
-            key=lambda item: (-item[1], item[0]),
-        )
-        if tokens > 0
-    ]
-    return ModelUsageWindow(
-        label=label,
-        window_minutes=window_minutes,
-        total_tokens=total,
-        models=models,
-    )
+def _declared_effort(payload: Dict[str, Any]) -> Optional[str]:
+    """Return the effort a turn context or thread settings declares.
+
+    Turn contexts name the field `effort`; thread settings have also used
+    `reasoning_effort`. A present-but-null value is a real answer — the model
+    takes no reasoning effort — so only an absent key returns None, leaving the
+    effort already in force untouched.
+    """
+    for field in ("effort", "reasoning_effort"):
+        if field in payload:
+            return normalize_effort(payload[field])
+    return None
 
 
 def _chatgpt_usage(
@@ -238,7 +230,7 @@ def _chatgpt_usage(
         current - timedelta(minutes=window_minutes)
         for _, window_minutes in USAGE_WINDOWS
     ]
-    model_counts: List[DefaultDict[str, int]] = [
+    model_counts: List[DefaultDict[Tuple[str, str], int]] = [
         defaultdict(int)
         for _ in USAGE_WINDOWS
     ]
@@ -249,6 +241,7 @@ def _chatgpt_usage(
     if root.exists():
         for path in root.glob("*/*/*/rollout-*.jsonl"):
             active_model = "unknown"
+            active_effort = UNSPECIFIED_EFFORT
             previous_total = 0
             previous_usage = _usage_breakdown(None)
             try:
@@ -267,6 +260,9 @@ def _chatgpt_usage(
                             model = payload.get("model")
                             if isinstance(model, str) and model:
                                 active_model = model
+                            effort = _declared_effort(payload)
+                            if effort is not None:
+                                active_effort = effort
                             continue
                         if (
                             record.get("type") == "event_msg"
@@ -277,6 +273,9 @@ def _chatgpt_usage(
                                 model = settings.get("model")
                                 if isinstance(model, str) and model:
                                     active_model = model
+                                effort = _declared_effort(settings)
+                                if effort is not None:
+                                    active_effort = effort
                             continue
                         if (
                             record.get("type") != "event_msg"
@@ -317,7 +316,9 @@ def _chatgpt_usage(
                             continue
                         for index, cutoff in enumerate(cutoffs):
                             if cutoff <= timestamp <= current:
-                                model_counts[index][active_model] += last_tokens
+                                model_counts[index][
+                                    (active_model, active_effort)
+                                ] += last_tokens
                                 for component in USAGE_COMPONENTS:
                                     local_counts[index][component] += (
                                         last_token_usage[component]
@@ -340,7 +341,7 @@ def _chatgpt_usage(
         for index, (label, _) in enumerate(USAGE_WINDOWS)
     ]
     model_usage = [
-        _model_usage_window(
+        model_usage_window(
             label,
             window_minutes,
             model_counts[index],
