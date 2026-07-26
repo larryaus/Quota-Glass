@@ -34,12 +34,16 @@ BACKEND_PORT=8000
 
 # Bind-test the port the same way uvicorn will, so a conflict surfaces here as
 # a readable message instead of a buried traceback after both children start.
+# SO_REUSEADDR matters: uvicorn sets it, so without it this probe is stricter
+# than the server it guards and reports a false conflict against the lingering
+# TIME_WAIT sockets left by a just-stopped instance — i.e. on every restart.
 port_is_busy() {
   "$REPO_DIR/.venv/bin/python" - "$1" <<'PY'
 import socket
 import sys
 
 with socket.socket() as probe:
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         probe.bind(("127.0.0.1", int(sys.argv[1])))
     except OSError:
