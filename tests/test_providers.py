@@ -540,6 +540,50 @@ def test_chatgpt_serves_cached_live_reading_during_backoff(tmp_path, fixture_dir
     assert "hung" in state.error
 
 
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_chatgpt_non_finite_percentage_is_dropped(tmp_path, literal):
+    """json.loads accepts bare NaN and Infinity from either source.
+
+    max(0.0, min(100.0, nan)) is exactly 100.0, which meets the default
+    ALERT_THRESHOLD_PCT and fires a bogus "quota exhausted" notification, so a
+    non-finite reading must become no reading at all (AlertEngine skips
+    used_pct=None).
+    """
+    from app.providers.chatgpt import parse_chatgpt
+    from app.providers.live_cache import LiveSourceCache
+
+    live_payload = json.loads(
+        '{"rateLimits": {"primary": {"usedPercent": %s,'
+        ' "windowDurationMins": 300, "resetsAt": 1785621948}}}' % literal
+    )
+    live = parse_chatgpt(
+        tmp_path,
+        enable_live=True,
+        live_cache=LiveSourceCache("Codex CLI"),
+        live_reader=lambda cli_path, timeout_seconds: live_payload,
+    )
+
+    assert live.mode == "oauth"
+    assert [meter.key for meter in live.meters] == ["chatgpt.primary"]
+    assert live.meters[0].used_pct is None
+
+    snapshot = tmp_path / "2026" / "07" / "26" / "rollout-nonfinite.jsonl"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text(
+        json.dumps(_token_record("2026-07-26T11:59:00Z", float(literal)))
+        + "\n",
+        encoding="utf-8",
+    )
+    rollout = parse_chatgpt(
+        tmp_path,
+        now=datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert rollout.mode == "local"
+    assert [meter.key for meter in rollout.meters] == ["chatgpt.primary"]
+    assert rollout.meters[0].used_pct is None
+
+
 def test_chatgpt_live_disabled_keeps_local_mode(tmp_path, fixture_dir):
     from app.providers.chatgpt import parse_chatgpt
 

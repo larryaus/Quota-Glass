@@ -1,4 +1,5 @@
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
@@ -51,9 +52,15 @@ def _clamp_percent(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
-        return max(0.0, min(100.0, float(value)))
+        numeric = float(value)
     except (TypeError, ValueError):
         return None
+    # json.loads accepts bare NaN and Infinity, and clamping either one lands
+    # on a real-looking percentage (NaN clamps to exactly 100.0, which meets
+    # the default alert threshold). No reading beats an invented one.
+    if not math.isfinite(numeric):
+        return None
+    return max(0.0, min(100.0, numeric))
 
 
 def _optional_int(value: Any) -> Optional[int]:
