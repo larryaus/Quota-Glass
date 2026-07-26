@@ -8,7 +8,7 @@ type Meter = {
   window_minutes: number | null;
   resets_at: number | null;
   has_quota: boolean;
-  source: "rollout" | "oauth" | "local";
+  source: "rollout" | "oauth" | "local" | "app-server";
   stale: boolean;
 };
 
@@ -327,18 +327,18 @@ function ProviderPanel({ provider, now }: { provider: Provider; now: number }) {
             </span>
           )}
           {provider.credits.spend_limit_reached && <span>Spend limit reached</span>}
-          {provider.key === "claude" && oauthCacheAge !== null && (
-            <span>OAuth reading {durationLabel(oauthCacheAge)}</span>
+          {oauthCacheAge !== null && (
+            <span>Live reading {durationLabel(oauthCacheAge)}</span>
           )}
         </div>
       </header>
 
-      {provider.key === "claude" && provider.oauth_backed_off && (
+      {provider.oauth_backed_off && (
         <div className="oauth-status" role="status">
           <strong>
             {provider.oauth_backoff_reason?.startsWith("Rate limited")
-              ? "OAuth rate limited"
-              : "OAuth retry delayed"}
+              ? "Live source rate limited"
+              : "Live source retry delayed"}
           </strong>
           <p>
             {provider.oauth_backoff_reason}
@@ -356,18 +356,25 @@ function ProviderPanel({ provider, now }: { provider: Provider; now: number }) {
         </div>
       )}
 
-      {provider.key === "claude" &&
-        provider.mode === "local" &&
-        !provider.oauth_backed_off && (
-          <div className="local-note">
-            <strong>Local-only mode</strong>
+      {provider.mode === "local" && !provider.oauth_backed_off && (
+        <div className="local-note">
+          <strong>Local-only mode</strong>
+          {provider.key === "claude" ? (
             <p>
               Claude’s local records provide token and cost estimates, not quota
               percentages. Set <code>ENABLE_CLAUDE_OAUTH=1</code> before starting
               the app to opt into the fragile live-percentage source.
             </p>
-          </div>
-        )}
+          ) : (
+            <p>
+              ChatGPT percentages come from Codex session files on disk, so they
+              are only as fresh as your last Codex session. Set{" "}
+              <code>ENABLE_CHATGPT_LIVE=1</code> before starting the app to read
+              live figures through the Codex CLI.
+            </p>
+          )}
+        </div>
+      )}
 
       <div className="meter-grid">
         {provider.meters
