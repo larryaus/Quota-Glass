@@ -60,6 +60,12 @@ class Settings:
         smtp_password: Optional[str] = None,
         smtp_security: Optional[str] = None,
         smtp_timeout_seconds: Optional[int] = None,
+        enable_burn_rate: Optional[bool] = None,
+        burn_rate_window_minutes: Optional[int] = None,
+        burn_rate_min_samples: Optional[int] = None,
+        burn_rate_min_span_seconds: Optional[int] = None,
+        projection_alert_enabled: Optional[bool] = None,
+        projection_alert_margin_seconds: Optional[int] = None,
     ) -> None:
         home = Path.home()
         self.enable_claude_oauth = (
@@ -208,4 +214,41 @@ class Settings:
             _int_env("SMTP_TIMEOUT_SECONDS", 10)
             if smtp_timeout_seconds is None
             else smtp_timeout_seconds,
+        )
+        # Burn rate is arithmetic over samples already on disk -- no network
+        # call, subprocess, or Keychain read -- so unlike the live sources it
+        # defaults on.
+        self.enable_burn_rate = (
+            _bool_env("ENABLE_BURN_RATE", True)
+            if enable_burn_rate is None
+            else enable_burn_rate
+        )
+        self.burn_rate_window_minutes = max(
+            1,
+            _int_env("BURN_RATE_WINDOW_MINUTES", 60)
+            if burn_rate_window_minutes is None
+            else burn_rate_window_minutes,
+        )
+        self.burn_rate_min_samples = max(
+            2,
+            _int_env("BURN_RATE_MIN_SAMPLES", 3)
+            if burn_rate_min_samples is None
+            else burn_rate_min_samples,
+        )
+        self.burn_rate_min_span_seconds = max(
+            1,
+            _int_env("BURN_RATE_MIN_SPAN_SECONDS", 600)
+            if burn_rate_min_span_seconds is None
+            else burn_rate_min_span_seconds,
+        )
+        self.projection_alert_enabled = (
+            _bool_env("PROJECTION_ALERT_ENABLED", True)
+            if projection_alert_enabled is None
+            else projection_alert_enabled
+        )
+        self.projection_alert_margin_seconds = max(
+            0,
+            _int_env("PROJECTION_ALERT_MARGIN_SECONDS", 900)
+            if projection_alert_margin_seconds is None
+            else projection_alert_margin_seconds,
         )

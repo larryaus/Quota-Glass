@@ -3,6 +3,18 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+class MeterProjection(BaseModel):
+    """Forward projection for one meter, derived from stored samples."""
+
+    burn_rate_pct_per_hour: float
+    # None when the burn rate is zero: nothing is being consumed, so there is
+    # no finite time at which the window runs out.
+    projected_exhaustion_at: Optional[int] = None
+    exhausts_before_reset: bool = False
+    sample_count: int
+    span_seconds: int
+
+
 class Meter(BaseModel):
     key: str
     provider: str
@@ -13,6 +25,7 @@ class Meter(BaseModel):
     has_quota: bool
     source: str
     stale: bool = False
+    projection: Optional[MeterProjection] = None
 
 
 class Credits(BaseModel):
@@ -90,6 +103,21 @@ class DashboardState(BaseModel):
     providers: List[ProviderState] = Field(default_factory=list)
     poller: PollerHealth = Field(default_factory=PollerHealth)
     generated_at: str
+
+
+class HistorySample(BaseModel):
+    sampled_at: int
+    meter_key: str
+    provider: str
+    used_pct: Optional[float] = None
+    stale: bool = False
+
+
+class HistoryResponse(BaseModel):
+    hours: int
+    # 0 means the rows are raw samples rather than time buckets.
+    bucket_seconds: int = 0
+    samples: List[HistorySample] = Field(default_factory=list)
 
 
 JsonDict = Dict[str, Any]

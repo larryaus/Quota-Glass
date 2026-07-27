@@ -48,7 +48,8 @@ flowchart TB
 
     subgraph backend["FastAPI backend — 127.0.0.1:8000"]
         poller["UsagePoller<br/>every POLL_INTERVAL_SECONDS"]
-        alerts["AlertEngine<br/>EXHAUSTED / REFRESHED"]
+        burn["Burn rate<br/>projected exhaustion"]
+        alerts["AlertEngine<br/>EXHAUSTED / REFRESHED<br/>PROJECTED_EXHAUSTION"]
         db[("SQLite<br/>data/usage.db")]
     end
 
@@ -62,12 +63,15 @@ flowchart TB
     keychain -.-> anthropic
     anthropic -.-> poller
 
-    poller --> alerts
+    poller --> burn
+    db -->|past samples| burn
+    burn --> alerts
     poller -->|samples| db
     alerts <-->|latch + events| db
     alerts --> macos
     alerts -.-> email
     ui -->|"GET /api/state"| poller
+    ui -->|"GET /api/history"| db
 ```
 
 Solid arrows are always on and never leave the machine. Dashed arrows are the
@@ -141,6 +145,21 @@ Set environment variables before running `./run.sh`:
 | `NOTIFICATIONS_ENABLED` | `1` | Set to `0` to suppress macOS notifications. |
 | `DATABASE_PATH` | `./data/usage.db` | SQLite file location. |
 
+### Burn rate and projections
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ENABLE_BURN_RATE` | `1` | Set to `0` to stop computing burn rates and projections. |
+| `BURN_RATE_WINDOW_MINUTES` | `60` | Trailing span the rate is measured over. |
+| `BURN_RATE_MIN_SAMPLES` | `3` | Samples required before a rate is reported. |
+| `BURN_RATE_MIN_SPAN_SECONDS` | `600` | Time the samples must cover before a rate is reported. |
+| `PROJECTION_ALERT_ENABLED` | `1` | Set to `0` to keep the projection but suppress its alert. |
+| `PROJECTION_ALERT_MARGIN_SECONDS` | `900` | How far ahead of the reset a projection must land to be worth alerting on. |
+
+Unlike the live sources, these default on: the burn rate is arithmetic over
+samples already stored in SQLite, so it makes no network call, starts no
+subprocess, and reads no Keychain item.
+
 ### Email delivery
 
 | Variable | Default | Meaning |
@@ -170,11 +189,34 @@ readings generate:
 - **Quota refreshed** after an exhaustion when the quota window rolls over or
   usage drops far enough to indicate a reset. `ALERT_RESET_PCT` catches a reset
   whose first new-window reading is already slightly above zero.
+- **Quota running out** when the current burn rate projects the meter hitting
+  100% more than `PROJECTION_ALERT_MARGIN_SECONDS` before its window resets.
+  This is the only alert that arrives while there is still quota left to
+  manage; it fires at most once per window and never for a meter that has
+  already reached `ALERT_THRESHOLD_PCT`, which quota exhausted already covers.
 
 Stale readings, local Claude estimates, and any other meter without a quota
 percentage never generate quota alerts. Each detected quota cycle exhausts at
 most once. Quota events and their delivery state are committed to SQLite before
 a notification is attempted, so restarts do not silently lose an alert.
+
+## Burn rate and projected exhaustion
+
+Every poll stores one sample per meter. Quota Glass reads the trailing
+`BURN_RATE_WINDOW_MINUTES` of those samples back to derive a burn rate in
+percent per hour, and from that the time the meter is on track to reach 100%.
+Each gauge shows the resulting sparkline and rate, and turns red when the
+projection lands before the window resets.
+
+Only samples from the meter's current quota window count, so a span never
+straddles a reset. Stale samples are excluded, because they repeat a reading
+the provider never refreshed and would understate the rate. Until there are
+`BURN_RATE_MIN_SAMPLES` samples covering `BURN_RATE_MIN_SPAN_SECONDS`, the card
+reads "Gathering data…" rather than guessing — at the default poll interval
+that is roughly the first ten minutes after a fresh start.
+
+Projections are estimates. They assume the recent rate continues unchanged,
+which is exactly what stopping work, or starting a long task, invalidates.
 
 ## Email alerts
 
@@ -275,8 +317,12 @@ curl http://127.0.0.1:8000/api/health
 
 ## API
 
-- `GET /api/state` — providers, meters, credits, errors, and poller health
-- `GET /api/history?hours=24` — sampled SQLite history
+- `GET /api/state` — providers, meters (each with its burn-rate projection),
+  credits, errors, and poller health
+- `GET /api/history?hours=24` — sampled SQLite history. Add `meter_key` to
+  narrow it to one meter, and `bucket_seconds` to collapse the rows into time
+  buckets carrying each bucket's peak; without bucketing a 30-day request
+  returns every raw sample.
 - `GET /api/events?limit=50` — recent fired alerts
 - `POST /api/refresh` — immediate poll; while one is already in flight it
   returns the current state instead of queueing behind it

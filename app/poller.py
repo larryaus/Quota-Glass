@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from app.alerting import AlertEngine
 from app.database import Database
+from app.history import projection_for, window_start
 from app.models import DashboardState, Meter, PollerHealth, ProviderState
 from app.providers.chatgpt import parse_chatgpt
 from app.providers.claude import ClaudeOAuthCache, parse_claude
@@ -106,6 +107,11 @@ class UsagePoller:
                 meters: List[Meter] = [
                     meter for provider in self.providers for meter in provider.meters
                 ]
+                if self.settings.enable_burn_rate:
+                    try:
+                        await asyncio.to_thread(self._attach_projections, meters)
+                    except Exception as exc:
+                        errors.append("Burn rate calculation failed: %s" % exc)
                 for meter in meters:
                     try:
                         await asyncio.to_thread(
@@ -172,6 +178,33 @@ class UsagePoller:
             return self.state()
         finally:
             self._refresh_lock.release()
+
+    def _attach_projections(self, meters: List[Meter]) -> None:
+        """Fill in `meter.projection` from each meter's stored samples.
+
+        Runs before alerting, because the alert engine reads the projection.
+        Samples are persisted later in the same poll, so the stored series ends
+        one poll behind; `projection_for` appends the live reading to close
+        that gap.
+        """
+        now = int(time.time())
+        since = now - self.settings.burn_rate_window_minutes * 60
+        for meter in meters:
+            if not meter.has_quota or meter.stale or meter.used_pct is None:
+                continue
+            start = window_start(meter)
+            rows = self.database.get_recent_samples(
+                meter.key,
+                since if start is None else max(start, since),
+            )
+            meter.projection = projection_for(
+                rows,
+                meter,
+                now,
+                trailing_minutes=self.settings.burn_rate_window_minutes,
+                min_samples=self.settings.burn_rate_min_samples,
+                min_span_seconds=self.settings.burn_rate_min_span_seconds,
+            )
 
     def state(self) -> DashboardState:
         if self._last_poll_completed_monotonic is not None:

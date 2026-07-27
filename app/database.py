@@ -52,6 +52,8 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_samples_time
                     ON samples(sampled_at);
+                CREATE INDEX IF NOT EXISTS idx_samples_meter_time
+                    ON samples(meter_key, sampled_at);
                 CREATE INDEX IF NOT EXISTS idx_events_time
                     ON events(created_at DESC);
                 """
@@ -67,6 +69,11 @@ class Database:
                 "INTEGER NOT NULL DEFAULT 0",
             )
             self._add_column_if_missing(
+                "meter_state",
+                "fired_projection_for_window",
+                "INTEGER",
+            )
+            self._add_column_if_missing(
                 "events",
                 "notification_status",
                 "TEXT NOT NULL DEFAULT 'delivered'",
@@ -80,6 +87,16 @@ class Database:
                 "events",
                 "notification_error",
                 "TEXT",
+            )
+            self._add_column_if_missing(
+                "events",
+                "burn_rate_pct_per_hour",
+                "REAL",
+            )
+            self._add_column_if_missing(
+                "events",
+                "projected_exhaustion_at",
+                "INTEGER",
             )
 
     def _add_column_if_missing(
@@ -116,6 +133,7 @@ class Database:
         last_event_at: Optional[int],
         missing_polls: int = 0,
         reseed_required: bool = False,
+        fired_projection_for_window: Optional[int] = None,
     ) -> None:
         with self._lock, self._connection:
             self._put_meter_state(
@@ -126,6 +144,7 @@ class Database:
                 last_event_at,
                 missing_polls,
                 reseed_required,
+                fired_projection_for_window,
             )
 
     def _put_meter_state(
@@ -137,6 +156,7 @@ class Database:
         last_event_at: Optional[int],
         missing_polls: int,
         reseed_required: bool,
+        fired_projection_for_window: Optional[int] = None,
     ) -> None:
         self._connection.execute(
             """
@@ -148,16 +168,19 @@ class Database:
                     fired_full_for_window,
                     last_event_at,
                     missing_polls,
-                    reseed_required
+                    reseed_required,
+                    fired_projection_for_window
                 )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
                 last_pct = excluded.last_pct,
                 window_id = excluded.window_id,
                 fired_full_for_window = excluded.fired_full_for_window,
                 last_event_at = excluded.last_event_at,
                 missing_polls = excluded.missing_polls,
-                reseed_required = excluded.reseed_required
+                reseed_required = excluded.reseed_required,
+                fired_projection_for_window =
+                    excluded.fired_projection_for_window
             """,
             (
                 key,
@@ -167,6 +190,7 @@ class Database:
                 last_event_at,
                 max(0, missing_polls),
                 int(reseed_required),
+                fired_projection_for_window,
             ),
         )
 
@@ -178,8 +202,15 @@ class Database:
         created_at: int,
         fired_full_for_window: Optional[int],
         last_event_at: Optional[int],
+        fired_projection_for_window: Optional[int] = None,
     ) -> List[int]:
         event_ids: List[int] = []
+        # The projection is copied onto the event row so a notification retried
+        # after a restart still reports the rate that triggered it, rather than
+        # whatever the meter happens to be doing when delivery succeeds.
+        projection = meter.projection
+        burn_rate = None if projection is None else projection.burn_rate_pct_per_hour
+        projected_at = None if projection is None else projection.projected_exhaustion_at
         with self._lock, self._connection:
             # The state latch is written first and committed atomically with all
             # pending event rows. Notification delivery happens only afterward.
@@ -191,6 +222,7 @@ class Database:
                 last_event_at,
                 0,
                 False,
+                fired_projection_for_window,
             )
             for event_type in event_types:
                 cursor = self._connection.execute(
@@ -204,9 +236,11 @@ class Database:
                             used_pct,
                             window_id,
                             created_at,
-                            notification_status
+                            notification_status,
+                            burn_rate_pct_per_hour,
+                            projected_exhaustion_at
                         )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                     """,
                     (
                         event_type,
@@ -216,6 +250,8 @@ class Database:
                         meter.used_pct,
                         window_id,
                         created_at,
+                        burn_rate,
+                        projected_at,
                     ),
                 )
                 event_ids.append(int(cursor.lastrowid))
@@ -337,11 +373,16 @@ class Database:
                         fired_full_for_window = CASE
                             WHEN ? THEN NULL
                             ELSE fired_full_for_window
+                        END,
+                        fired_projection_for_window = CASE
+                            WHEN ? THEN NULL
+                            ELSE fired_projection_for_window
                         END
                     WHERE key = ?
                     """,
                     (
                         missing_polls,
+                        int(reseed_required),
                         int(reseed_required),
                         int(reseed_required),
                         key,
@@ -389,19 +430,82 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_history(self, hours: int = 24) -> List[Dict[str, Any]]:
-        safe_hours = max(1, min(24 * 30, hours))
-        cutoff = int(time.time()) - safe_hours * 3600
+    def get_recent_samples(
+        self,
+        meter_key: str,
+        since: int,
+    ) -> List[Dict[str, Any]]:
+        """Raw samples for one meter since `since`, oldest first.
+
+        Served by `idx_samples_meter_time`. This is what the burn-rate
+        arithmetic reads every poll; `get_history` scans far too much.
+        """
         with self._lock:
             rows = self._connection.execute(
                 """
                 SELECT sampled_at, meter_key, provider, used_pct, stale
                 FROM samples
-                WHERE sampled_at >= ?
+                WHERE meter_key = ? AND sampled_at >= ?
                 ORDER BY sampled_at ASC, id ASC
                 """,
-                (cutoff,),
+                (meter_key, int(since)),
             ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_history(
+        self,
+        hours: int = 24,
+        meter_key: Optional[str] = None,
+        bucket_seconds: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Sampled history, optionally for one meter and collapsed into buckets.
+
+        Without bucketing a 30-day request returns every raw row -- at a 60s
+        poll across five meters that is roughly 216,000 of them. Buckets carry
+        `MAX(used_pct)`: the peak inside a bucket is the meaningful reading for
+        a quota meter, and taking the max preserves the monotonic rise within a
+        window that the chart and the burn rate both rely on.
+        """
+        safe_hours = max(1, min(24 * 30, hours))
+        cutoff = int(time.time()) - safe_hours * 3600
+        bucket = 0 if bucket_seconds is None else max(1, int(bucket_seconds))
+        filters = "WHERE sampled_at >= ?"
+        filter_params: List[Any] = [cutoff]
+        if meter_key is not None:
+            filters += " AND meter_key = ?"
+            filter_params.append(meter_key)
+
+        if bucket:
+            # The bucket column is named `bucket`, not `sampled_at`: a result
+            # alias that collides with a real column loses to the column in
+            # GROUP BY, which would silently group by the raw timestamp and
+            # collapse nothing. The outer SELECT renames it for the caller.
+            query = """
+                SELECT bucket AS sampled_at, meter_key, provider, used_pct, stale
+                FROM (
+                    SELECT (sampled_at / ?) * ? AS bucket,
+                           meter_key,
+                           provider,
+                           MAX(used_pct) AS used_pct,
+                           MIN(stale) AS stale
+                    FROM samples
+                    %s
+                    GROUP BY bucket, meter_key, provider
+                )
+                ORDER BY sampled_at ASC, meter_key ASC
+                """ % filters
+            params: List[Any] = [bucket, bucket] + filter_params
+        else:
+            query = """
+                SELECT sampled_at, meter_key, provider, used_pct, stale
+                FROM samples
+                %s
+                ORDER BY sampled_at ASC, id ASC
+                """ % filters
+            params = filter_params
+
+        with self._lock:
+            rows = self._connection.execute(query, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
     def prune_history(

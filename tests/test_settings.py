@@ -69,3 +69,57 @@ def test_email_notifications_read_environment(monkeypatch):
     assert settings.smtp_security == "ssl"
     assert settings.smtp_port == 465
     assert settings.smtp_timeout_seconds == 15
+
+
+def test_burn_rate_defaults_on(monkeypatch):
+    """Unlike the live sources this is local arithmetic, so it defaults on."""
+    for name in (
+        "ENABLE_BURN_RATE",
+        "BURN_RATE_WINDOW_MINUTES",
+        "BURN_RATE_MIN_SAMPLES",
+        "BURN_RATE_MIN_SPAN_SECONDS",
+        "PROJECTION_ALERT_ENABLED",
+        "PROJECTION_ALERT_MARGIN_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings()
+
+    assert settings.enable_burn_rate is True
+    assert settings.burn_rate_window_minutes == 60
+    assert settings.burn_rate_min_samples == 3
+    assert settings.burn_rate_min_span_seconds == 600
+    assert settings.projection_alert_enabled is True
+    assert settings.projection_alert_margin_seconds == 900
+
+
+def test_burn_rate_reads_environment(monkeypatch):
+    monkeypatch.setenv("ENABLE_BURN_RATE", "0")
+    monkeypatch.setenv("BURN_RATE_WINDOW_MINUTES", "120")
+    monkeypatch.setenv("BURN_RATE_MIN_SAMPLES", "5")
+    monkeypatch.setenv("BURN_RATE_MIN_SPAN_SECONDS", "300")
+    monkeypatch.setenv("PROJECTION_ALERT_ENABLED", "0")
+    monkeypatch.setenv("PROJECTION_ALERT_MARGIN_SECONDS", "1800")
+    settings = Settings()
+
+    assert settings.enable_burn_rate is False
+    assert settings.burn_rate_window_minutes == 120
+    assert settings.burn_rate_min_samples == 5
+    assert settings.burn_rate_min_span_seconds == 300
+    assert settings.projection_alert_enabled is False
+    assert settings.projection_alert_margin_seconds == 1800
+
+
+def test_burn_rate_explicit_arguments_beat_environment(monkeypatch):
+    monkeypatch.setenv("ENABLE_BURN_RATE", "0")
+    monkeypatch.setenv("BURN_RATE_MIN_SAMPLES", "9")
+    settings = Settings(enable_burn_rate=True, burn_rate_min_samples=4)
+
+    assert settings.enable_burn_rate is True
+    assert settings.burn_rate_min_samples == 4
+
+
+def test_burn_rate_minimum_sample_count_is_clamped(monkeypatch):
+    """Two points are the fewest that can describe a rate at all."""
+    monkeypatch.delenv("BURN_RATE_MIN_SAMPLES", raising=False)
+
+    assert Settings(burn_rate_min_samples=1).burn_rate_min_samples == 2

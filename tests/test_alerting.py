@@ -5,7 +5,7 @@ import pytest
 
 from app.alerting import AlertEngine
 from app.database import Database
-from app.models import Meter
+from app.models import Meter, MeterProjection
 
 
 def meter(
@@ -287,3 +287,168 @@ def test_notification_retry_cap_stops_further_attempts(tmp_path):
     assert event["notification_attempts"] == 2
     assert "notification center unavailable" in event["notification_error"]
     assert notifier.calls == 2
+
+
+def projecting(
+    pct=40.0,
+    resets_at=1_800_000_000,
+    projected_exhaustion_at=1_800_000_000 - 7200,
+    rate=25.0,
+    stale=False,
+    has_quota=True,
+) -> Meter:
+    """A meter carrying a projection that runs out before it resets."""
+    reading = meter(pct, resets_at, stale=stale, has_quota=has_quota)
+    reading.projection = MeterProjection(
+        burn_rate_pct_per_hour=rate,
+        projected_exhaustion_at=projected_exhaustion_at,
+        exhausts_before_reset=(
+            projected_exhaustion_at is not None
+            and resets_at is not None
+            and projected_exhaustion_at < resets_at
+        ),
+        sample_count=4,
+        span_seconds=1800,
+    )
+    return reading
+
+
+def test_projected_exhaustion_fires_once_per_window(tmp_path, recording_notifier):
+    database, alerts = engine(tmp_path, recording_notifier)
+    alerts.process(projecting(30.0), now=100)
+
+    assert alerts.process(projecting(40.0), now=101) == ["PROJECTED_EXHAUSTION"]
+    assert alerts.process(projecting(50.0), now=102) == []
+    assert alerts.process(projecting(60.0), now=103) == []
+
+    events = database.get_events()
+    assert [row["event_type"] for row in events] == ["PROJECTED_EXHAUSTION"]
+    assert events[0]["burn_rate_pct_per_hour"] == 25.0
+    assert events[0]["projected_exhaustion_at"] == 1_800_000_000 - 7200
+    assert [call[0] for call in recording_notifier.calls] == ["Quota running out"]
+
+
+def test_projected_exhaustion_message_reports_rate_and_headroom(
+    tmp_path, recording_notifier
+):
+    database, alerts = engine(tmp_path, recording_notifier)
+    alerts.process(projecting(30.0), now=100)
+    alerts.process(projecting(40.0), now=101)
+
+    message = recording_notifier.calls[0][2]
+    assert "40%" in message
+    assert "25.0%/hr" in message
+    assert "2h before this window resets" in message
+
+
+def test_projection_inside_the_margin_does_not_fire(tmp_path, recording_notifier):
+    """A projection that lands essentially at the reset is not actionable.
+
+    Without the margin the alert would flap as the estimate drifts either side
+    of the reset timestamp.
+    """
+    database, alerts = engine(tmp_path, recording_notifier)
+    near_reset = 1_800_000_000 - 60
+    alerts.process(projecting(30.0, projected_exhaustion_at=near_reset), now=100)
+
+    assert (
+        alerts.process(
+            projecting(40.0, projected_exhaustion_at=near_reset),
+            now=101,
+        )
+        == []
+    )
+    assert database.get_events() == []
+
+
+def test_projection_after_the_reset_does_not_fire(tmp_path, recording_notifier):
+    database, alerts = engine(tmp_path, recording_notifier)
+    later = 1_800_000_000 + 7200
+    alerts.process(projecting(30.0, projected_exhaustion_at=later), now=100)
+
+    assert (
+        alerts.process(projecting(40.0, projected_exhaustion_at=later), now=101)
+        == []
+    )
+    assert database.get_events() == []
+
+
+def test_meter_already_at_threshold_gets_exhausted_not_a_projection(
+    tmp_path, recording_notifier
+):
+    """EXHAUSTED owns a meter that is already full; a warning would be late."""
+    database, alerts = engine(tmp_path, recording_notifier)
+    alerts.process(projecting(90.0), now=100)
+
+    assert alerts.process(projecting(100.0), now=101) == ["EXHAUSTED"]
+    assert [row["event_type"] for row in database.get_events()] == ["EXHAUSTED"]
+
+
+def test_stale_or_quotaless_meters_never_fire_a_projection(
+    tmp_path, recording_notifier
+):
+    database, alerts = engine(tmp_path, recording_notifier)
+    alerts.process(projecting(30.0), now=100)
+
+    assert alerts.process(projecting(40.0, stale=True), now=101) == []
+    assert alerts.process(projecting(40.0, has_quota=False), now=102) == []
+    assert database.get_events() == []
+
+
+def test_meter_without_a_projection_never_fires(tmp_path, recording_notifier):
+    database, alerts = engine(tmp_path, recording_notifier)
+    alerts.process(meter(30.0), now=100)
+
+    assert alerts.process(meter(40.0), now=101) == []
+    assert database.get_events() == []
+
+
+def test_projection_latch_clears_on_rollover_and_can_fire_again(
+    tmp_path, recording_notifier
+):
+    database, alerts = engine(tmp_path, recording_notifier)
+    alerts.process(projecting(30.0, resets_at=2000, projected_exhaustion_at=1000), now=100)
+    assert alerts.process(
+        projecting(40.0, resets_at=2000, projected_exhaustion_at=1000),
+        now=101,
+    ) == ["PROJECTED_EXHAUSTION"]
+
+    # A new window: the latch belongs to the window that just ended.
+    assert alerts.process(
+        projecting(10.0, resets_at=20000, projected_exhaustion_at=19000),
+        now=102,
+    ) == ["PROJECTED_EXHAUSTION"]
+    assert [row["event_type"] for row in database.get_events()] == [
+        "PROJECTED_EXHAUSTION",
+        "PROJECTED_EXHAUSTION",
+    ]
+
+
+def test_projection_latch_survives_restart_without_double_firing(
+    tmp_path, recording_notifier
+):
+    database, alerts = engine(tmp_path, recording_notifier)
+    alerts.process(projecting(30.0), now=100)
+    assert alerts.process(projecting(40.0), now=101) == ["PROJECTED_EXHAUSTION"]
+
+    database.close()
+    reopened = Database(tmp_path / "usage.db")
+    restarted = AlertEngine(reopened, recording_notifier, 100.0, 5.0)
+
+    assert restarted.process(projecting(50.0), now=200) == []
+    assert len(reopened.get_events()) == 1
+
+
+def test_projection_alerts_can_be_disabled(tmp_path, recording_notifier):
+    database = Database(tmp_path / "usage.db")
+    alerts = AlertEngine(
+        database,
+        recording_notifier,
+        100.0,
+        5.0,
+        projection_alert_enabled=False,
+    )
+    alerts.process(projecting(30.0), now=100)
+
+    assert alerts.process(projecting(40.0), now=101) == []
+    assert database.get_events() == []

@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.alerting import AlertEngine
 from app.database import Database
+from app.models import HistoryResponse
 from app.notifier import (
     CompositeNotifier,
     MacOSNotifier,
@@ -57,6 +58,12 @@ def create_app(
         configured.alert_threshold_pct,
         configured.alert_reset_pct,
         max_notification_attempts=configured.max_notification_attempts,
+        projection_alert_enabled=(
+            configured.enable_burn_rate and configured.projection_alert_enabled
+        ),
+        projection_alert_margin_seconds=(
+            configured.projection_alert_margin_seconds
+        ),
     )
     poller = UsagePoller(configured, database, alert_engine)
 
@@ -106,15 +113,22 @@ def create_app(
     async def state(request: Request) -> dict:
         return request.app.state.poller.state().model_dump()
 
-    @api.get("/api/history")
+    @api.get("/api/history", response_model=HistoryResponse)
     async def history(
         request: Request,
         hours: int = Query(default=24, ge=1, le=720),
-    ) -> dict:
-        return {
-            "hours": hours,
-            "samples": request.app.state.database.get_history(hours),
-        }
+        meter_key: Optional[str] = Query(default=None),
+        bucket_seconds: int = Query(default=0, ge=0, le=86400),
+    ) -> HistoryResponse:
+        return HistoryResponse(
+            hours=hours,
+            bucket_seconds=bucket_seconds,
+            samples=request.app.state.database.get_history(
+                hours,
+                meter_key=meter_key,
+                bucket_seconds=bucket_seconds or None,
+            ),
+        )
 
     @api.get("/api/events")
     async def events(

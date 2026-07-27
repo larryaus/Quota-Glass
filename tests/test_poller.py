@@ -381,3 +381,88 @@ async def test_live_cache_survives_across_polls(monkeypatch, tmp_path):
     await poller.refresh()
 
     assert seen[0] is seen[1], "cache must persist so backoff state is not lost"
+
+
+@pytest.mark.asyncio
+async def test_poll_attaches_a_projection_and_alerts_on_it(monkeypatch, tmp_path):
+    """End to end: stored samples become a projection, then an alert.
+
+    The meter's five-hour window is three hours old and resets in two, but it
+    is climbing fast enough to run out in one, so the poll must both publish
+    the burn rate and fire the warning.
+    """
+    now = int(time.time())
+    resets_at = now + 2 * 3600
+
+    def chatgpt(*args, **kwargs):
+        return ProviderState(
+            key="chatgpt",
+            label="ChatGPT",
+            mode="rollout",
+            meters=[quota_meter("chatgpt", 60.0, resets_at)],
+        )
+
+    async def claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", claude)
+    settings = poller_settings(tmp_path)
+    database = Database(settings.database_path)
+    alerts = AlertEngine(database, NullNotifier())
+    # Seed a baseline so the first real reading is not swallowed by seeding,
+    # plus a rising series: 20% over the last half hour is 40%/hr.
+    alerts.process(quota_meter("chatgpt", 40.0, resets_at), now=now - 1)
+    for offset, pct in ((1800, 40.0), (1200, 47.0), (600, 53.0)):
+        database.add_samples(
+            [quota_meter("chatgpt", pct, resets_at)],
+            sampled_at=now - offset,
+        )
+    poller = UsagePoller(settings, database, alerts)
+
+    state = await poller.refresh()
+
+    projection = state.providers[0].meters[0].projection
+    assert projection is not None
+    assert projection.burn_rate_pct_per_hour == 40.0
+    assert projection.exhausts_before_reset is True
+    assert [row["event_type"] for row in database.get_events()] == [
+        "PROJECTED_EXHAUSTION"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_burn_rate_can_be_disabled(monkeypatch, tmp_path):
+    """The same series that alerts above must stay silent when switched off."""
+    now = int(time.time())
+    resets_at = now + 2 * 3600
+
+    def chatgpt(*args, **kwargs):
+        return ProviderState(
+            key="chatgpt",
+            label="ChatGPT",
+            mode="rollout",
+            meters=[quota_meter("chatgpt", 60.0, resets_at)],
+        )
+
+    async def claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", claude)
+    settings = poller_settings(tmp_path, enable_burn_rate=False)
+    database = Database(settings.database_path)
+    alerts = AlertEngine(database, NullNotifier())
+    alerts.process(quota_meter("chatgpt", 40.0, resets_at), now=now - 1)
+    for offset, pct in ((1800, 40.0), (1200, 47.0), (600, 53.0)):
+        database.add_samples(
+            [quota_meter("chatgpt", pct, resets_at)],
+            sampled_at=now - offset,
+        )
+    poller = UsagePoller(settings, database, alerts)
+
+    state = await poller.refresh()
+
+    assert state.providers[0].meters[0].projection is None
+    assert database.get_events() == []
+    assert state.poller.status == "healthy"

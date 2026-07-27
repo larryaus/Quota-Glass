@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+type MeterProjection = {
+  burn_rate_pct_per_hour: number;
+  projected_exhaustion_at: number | null;
+  exhausts_before_reset: boolean;
+  sample_count: number;
+  span_seconds: number;
+};
+
 type Meter = {
   key: string;
   provider: "chatgpt" | "claude";
@@ -9,6 +17,15 @@ type Meter = {
   resets_at: number | null;
   has_quota: boolean;
   source: "rollout" | "oauth" | "local" | "app-server";
+  stale: boolean;
+  projection: MeterProjection | null;
+};
+
+type HistorySample = {
+  sampled_at: number;
+  meter_key: string;
+  provider: string;
+  used_pct: number | null;
   stale: boolean;
 };
 
@@ -85,13 +102,19 @@ type DashboardState = {
 
 type AlertEvent = {
   id: number;
-  event_type: "EXHAUSTED" | "REFRESHED";
+  event_type: "EXHAUSTED" | "REFRESHED" | "PROJECTED_EXHAUSTION";
   meter_key: string;
   provider: string;
   label: string;
   used_pct: number | null;
   created_at: number;
 };
+
+// How much history the sparkline covers, and how coarsely the backend buckets
+// it. Six hours at five-minute buckets is ~72 points per meter -- enough shape
+// to read a trend, small enough to re-fetch on every 15s poll.
+const HISTORY_HOURS = 6;
+const HISTORY_BUCKET_SECONDS = 300;
 
 // Matches app/providers/usage.py: the label for records that named no effort.
 const UNSPECIFIED_EFFORT = "unspecified";
@@ -151,7 +174,108 @@ function retryTime(value: string | null): string {
   }).format(new Date(value));
 }
 
-function Gauge({ meter, now }: { meter: Meter; now: number }) {
+function shortDuration(seconds: number): string {
+  const totalMinutes = Math.max(0, Math.floor(seconds / 60));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours && minutes) return `${hours}h ${minutes}m`;
+  if (hours) return `${hours}h`;
+  return `${minutes}m`;
+}
+
+// A polyline over the meter's own min/max, so a series that only moves a few
+// percent still shows its shape. The width is normalised to the full time span
+// rather than to sample index, so a gap in polling reads as a gap.
+function Sparkline({ points, label }: { points: HistorySample[]; label: string }) {
+  const usable = points.filter(
+    (point): point is HistorySample & { used_pct: number } => point.used_pct !== null,
+  );
+  if (usable.length < 2) return null;
+
+  const values = usable.map((point) => point.used_pct);
+  const times = usable.map((point) => point.sampled_at);
+  const lowest = Math.min(...values);
+  const highest = Math.max(...values);
+  const earliest = Math.min(...times);
+  const latest = Math.max(...times);
+  const timeSpan = latest - earliest || 1;
+  // Keep a floor on the vertical range so a flat series draws a flat line
+  // through the middle instead of amplifying rounding noise into a sawtooth.
+  const valueSpan = Math.max(highest - lowest, 5);
+  const floor = highest - valueSpan;
+
+  const coordinates = usable
+    .map((point) => {
+      const x = ((point.sampled_at - earliest) / timeSpan) * 100;
+      const y = 22 - ((point.used_pct - floor) / valueSpan) * 20;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
+
+  return (
+    <svg
+      className="sparkline"
+      viewBox="0 0 100 24"
+      preserveAspectRatio="none"
+      role="img"
+      aria-label={`${label}: ${lowest.toFixed(0)} to ${highest.toFixed(
+        0,
+      )} percent over the last ${shortDuration(timeSpan)}`}
+    >
+      <polyline points={coordinates} />
+    </svg>
+  );
+}
+
+function BurnRate({ meter, now }: { meter: Meter; now: number }) {
+  const projection = meter.projection;
+  if (!projection) {
+    return (
+      <div className="burn-rate pending">
+        <span>Burn rate</span>
+        <strong>Gathering data…</strong>
+      </div>
+    );
+  }
+  if (projection.burn_rate_pct_per_hour <= 0) {
+    return (
+      <div className="burn-rate">
+        <span>Burn rate</span>
+        <strong>Idle</strong>
+      </div>
+    );
+  }
+
+  const rate = `${projection.burn_rate_pct_per_hour.toFixed(1)}%/hr`;
+  const projectedAt = projection.projected_exhaustion_at;
+  const remaining =
+    projectedAt === null ? null : Math.max(0, projectedAt * 1000 - now);
+
+  return (
+    <div className={`burn-rate ${projection.exhausts_before_reset ? "warning" : ""}`}>
+      <span>↗ {rate}</span>
+      {remaining !== null && (
+        <strong>
+          {projection.exhausts_before_reset ? "Runs out in " : "Full in "}
+          {shortDuration(remaining / 1000)}
+        </strong>
+      )}
+      {projection.exhausts_before_reset && (
+        <small>before this window resets</small>
+      )}
+    </div>
+  );
+}
+
+function Gauge({
+  meter,
+  now,
+  history,
+}: {
+  meter: Meter;
+  now: number;
+  history: HistorySample[];
+}) {
   const value = meter.used_pct === null ? 0 : Math.min(100, Math.max(0, meter.used_pct));
   const gaugeStyle = {
     "--meter-value": `${value * 3.6}deg`,
@@ -197,6 +321,10 @@ function Gauge({ meter, now }: { meter: Meter; now: number }) {
             <strong>{countdown(meter.resets_at, now)}</strong>
           </div>
         </div>
+      </div>
+      <div className="meter-trend">
+        <Sparkline points={history} label={meter.label} />
+        <BurnRate meter={meter} now={now} />
       </div>
     </article>
   );
@@ -375,7 +503,15 @@ function ModelUsageCard({ usage }: { usage: ModelUsageWindow }) {
   );
 }
 
-function ProviderPanel({ provider, now }: { provider: Provider; now: number }) {
+function ProviderPanel({
+  provider,
+  now,
+  history,
+}: {
+  provider: Provider;
+  now: number;
+  history: Map<string, HistorySample[]>;
+}) {
   const initials = provider.key === "chatgpt" ? "C" : "A";
   const oauthCacheAge =
     provider.oauth_cache_age_seconds === null
@@ -470,7 +606,12 @@ function ProviderPanel({ provider, now }: { provider: Provider; now: number }) {
         {provider.meters
           .filter((meter) => meter.has_quota)
           .map((meter) => (
-            <Gauge key={meter.key} meter={meter} now={now} />
+            <Gauge
+              key={meter.key}
+              meter={meter}
+              now={now}
+              history={history.get(meter.key) ?? []}
+            />
           ))}
         {provider.local_usage.map((usage) => (
           <LocalUsageCard
@@ -491,6 +632,18 @@ function ProviderPanel({ provider, now }: { provider: Provider; now: number }) {
       )}
     </section>
   );
+}
+
+function eventGlyph(eventType: AlertEvent["event_type"]): string {
+  if (eventType === "REFRESHED") return "↻";
+  if (eventType === "PROJECTED_EXHAUSTION") return "↗";
+  return "!";
+}
+
+function eventSummary(eventType: AlertEvent["event_type"]): string {
+  if (eventType === "REFRESHED") return "Quota refreshed";
+  if (eventType === "PROJECTED_EXHAUSTION") return "On track to run out early";
+  return "Quota exhausted";
 }
 
 function Events({ events }: { events: AlertEvent[] }) {
@@ -516,16 +669,14 @@ function Events({ events }: { events: AlertEvent[] }) {
           {events.map((event) => (
             <li key={event.id}>
               <span className={`event-icon ${event.event_type.toLowerCase()}`}>
-                {event.event_type === "REFRESHED" ? "↻" : "!"}
+                {eventGlyph(event.event_type)}
               </span>
               <div>
                 <strong>
                   {event.provider} · {event.label}
                 </strong>
                 <p>
-                  {event.event_type === "REFRESHED"
-                    ? "Quota refreshed"
-                    : "Quota exhausted"}
+                  {eventSummary(event.event_type)}
                   {event.used_pct !== null && ` at ${event.used_pct.toFixed(0)}%`}
                 </p>
               </div>
@@ -543,30 +694,47 @@ function Events({ events }: { events: AlertEvent[] }) {
 export default function App() {
   const [state, setState] = useState<DashboardState | null>(null);
   const [events, setEvents] = useState<AlertEvent[]>([]);
+  const [history, setHistory] = useState<HistorySample[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [now, setNow] = useState(Date.now());
 
   const load = useCallback(async () => {
     try {
-      const [stateResponse, eventsResponse] = await Promise.all([
+      // One bucketed request covers every meter; grouping happens below.
+      const [stateResponse, eventsResponse, historyResponse] = await Promise.all([
         fetch("/api/state"),
         fetch("/api/events?limit=20"),
+        fetch(
+          `/api/history?hours=${HISTORY_HOURS}&bucket_seconds=${HISTORY_BUCKET_SECONDS}`,
+        ),
       ]);
-      if (!stateResponse.ok || !eventsResponse.ok) {
+      if (!stateResponse.ok || !eventsResponse.ok || !historyResponse.ok) {
         throw new Error("The local backend returned an error.");
       }
-      const [nextState, nextEvents] = await Promise.all([
+      const [nextState, nextEvents, nextHistory] = await Promise.all([
         stateResponse.json() as Promise<DashboardState>,
         eventsResponse.json() as Promise<{ events: AlertEvent[] }>,
+        historyResponse.json() as Promise<{ samples: HistorySample[] }>,
       ]);
       setState(nextState);
       setEvents(nextEvents.events);
+      setHistory(nextHistory.samples);
       setError(null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Unable to reach the backend.");
     }
   }, []);
+
+  const historyByMeter = useMemo(() => {
+    const grouped = new Map<string, HistorySample[]>();
+    for (const sample of history) {
+      const existing = grouped.get(sample.meter_key);
+      if (existing) existing.push(sample);
+      else grouped.set(sample.meter_key, [sample]);
+    }
+    return grouped;
+  }, [history]);
 
   useEffect(() => {
     void load();
@@ -664,7 +832,12 @@ export default function App() {
           </div>
           <div className="provider-stack">
             {state.providers.map((provider) => (
-              <ProviderPanel key={provider.key} provider={provider} now={now} />
+              <ProviderPanel
+                key={provider.key}
+                provider={provider}
+                now={now}
+                history={historyByMeter}
+              />
             ))}
           </div>
           <Events events={events} />

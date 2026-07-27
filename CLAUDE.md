@@ -63,14 +63,18 @@ flowchart TB
     chatgpt --> poller["poller.py<br/>UsagePoller.refresh<br/>non-blocking lock"]
     claude --> poller
 
+    poller -->|"to_thread"| burn["history.py<br/>projection_for<br/>burn rate + projection"]
+    burn --> poller
     poller -->|"to_thread"| engine["alerting.py<br/>AlertEngine.process<br/>per Meter"]
     engine --> dbmod["database.py<br/>meter_state + events + samples"]
+    dbmod -->|"get_recent_samples"| burn
     poller -->|"to_thread: add_samples, prune"| dbmod
     engine --> notif["notifier.py<br/>MacOSNotifier + SmtpEmailNotifier"]
 
     poller --> state["models.py<br/>DashboardState"]
     state --> api["main.py<br/>/api/state /api/events"]
     api --> app["frontend/src/App.tsx<br/>polls every 15s"]
+    dbmod --> api
 ```
 
 Two edges above encode the invariants that are easiest to break:
@@ -117,6 +121,27 @@ Model percentages are shares of the window; effort percentages are shares of
 their own model. Effort is only ever read from the local record — records
 naming none land under `UNSPECIFIED_EFFORT` and are never guessed at.
 
+### Burn rate (`app/history.py`)
+
+`projection_for` turns stored `samples` rows into `Meter.projection`: a rate in
+percent per hour and the time the meter reaches 100%. Three rules carry the
+correctness, and all three are about **which samples are allowed into the span**:
+
+1. **Clip to the current window.** `window_start(meter)` is
+   `resets_at - window_minutes * 60`. A span that straddles a rollover describes
+   two windows and yields a negative delta. This is the same window-identity
+   idea as `_window_changed`, and the ±1s `resets_at` jitter only shifts the
+   boundary by a second.
+2. **Drop stale rows.** A stale sample repeats a reading the provider never
+   refreshed, so counting it stretches the span while holding the percentage
+   flat and understates the rate.
+3. **Append the live reading.** The poller persists samples *after* alerting, so
+   the stored series always lags one poll; `projection_for` closes that gap
+   itself rather than the pipeline being reordered.
+
+The rate is the first-to-last delta, not a least-squares fit: `used_pct` only
+rises inside a window, so the endpoint delta is already unbiased.
+
 ### Alerting durability (`app/alerting.py` + `app/database.py`)
 
 `EXHAUSTED` fires on crossing `ALERT_THRESHOLD_PCT`; `REFRESHED` fires on window
@@ -125,7 +150,18 @@ rollover, a usage drop past `RESET_DROP_EPSILON_PCT`, or a reading below
 `resets_at` is truncated to a whole second from a microsecond timestamp, so two
 reads of one window can differ by 1. `_window_changed` ignores differences
 within `WINDOW_JITTER_TOLERANCE_SECONDS`; a real rollover moves the reset by a
-whole window, so the two are never ambiguous. The latch (`meter_state.fired_full_for_window`) and the event
+whole window, so the two are never ambiguous.
+
+`PROJECTED_EXHAUSTION` fires when `Meter.projection.exhausts_before_reset` and
+the projection lands more than `PROJECTION_ALERT_MARGIN_SECONDS` before
+`resets_at` — without that margin it flaps as the estimate drifts either side of
+the reset. It is suppressed once `used_pct >= ALERT_THRESHOLD_PCT`, because
+`EXHAUSTED` owns that case. It has its **own** latch
+(`meter_state.fired_projection_for_window`) cleared in the same branch as the
+exhaustion latch on rollover, and cleared by `mark_meter_presence` on reseed —
+miss either and a stale latch suppresses a real warning.
+
+The latch (`meter_state.fired_full_for_window`) and the event
 rows are written in **one transaction before any notification is attempted**, so
 a crash mid-delivery retries the same row after restart rather than losing or
 duplicating an alert. Events move `pending → delivered | failed | abandoned`;
