@@ -13,6 +13,49 @@ The dashboard and its data stay local. Email, Claude OAuth, and live ChatGPT
 quota are opt-in network features. No provider API key or vendor billing
 organization is needed for the core dashboard.
 
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph onmac["On this Mac — always local"]
+        codexFiles["Codex session files<br/>~/.codex/sessions"]
+        claudeFiles["Claude Code records<br/>~/.claude/projects"]
+    end
+
+    subgraph optin["Opt-in — off by default"]
+        codexCli["codex app-server<br/>ENABLE_CHATGPT_LIVE"]
+        anthropic["api.anthropic.com<br/>ENABLE_CLAUDE_OAUTH"]
+        keychain["macOS Keychain<br/>token, per request only"]
+    end
+
+    subgraph backend["FastAPI backend — 127.0.0.1:8000"]
+        poller["UsagePoller<br/>every POLL_INTERVAL_SECONDS"]
+        alerts["AlertEngine<br/>EXHAUSTED / REFRESHED"]
+        db[("SQLite<br/>data/usage.db")]
+    end
+
+    ui["React dashboard<br/>localhost:5173"]
+    macos["macOS notification"]
+    email["SMTP email<br/>EMAIL_NOTIFICATIONS_ENABLED"]
+
+    codexFiles --> poller
+    claudeFiles --> poller
+    codexCli -.-> poller
+    keychain -.-> anthropic
+    anthropic -.-> poller
+
+    poller --> alerts
+    poller -->|samples| db
+    alerts <-->|latch + events| db
+    alerts --> macos
+    alerts -.-> email
+    ui -->|"GET /api/state"| poller
+```
+
+Solid arrows are always on and never leave the machine. Dashed arrows are the
+opt-in paths: each is off by default, and with all of them off Quota Glass makes
+no network call, spawns no subprocess, and never touches Keychain.
+
 ## Data sources
 
 - **ChatGPT:** reads the newest usable `token_count` snapshot from
