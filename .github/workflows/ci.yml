@@ -39,13 +39,20 @@ jobs:
       - name: Install lsof
         run: sudo apt-get install -y --no-install-recommends lsof
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      # A real .venv, not the bare interpreter: run.sh's port_is_busy() probe
+      # invokes .venv/bin/python directly, and tests/test_run_script.py
+      # executes that function. Installing into the interpreter instead makes
+      # those two tests fail with "No such file or directory". This also keeps
+      # CI identical to the setup documented in README.md and CLAUDE.md.
+      - name: Create virtualenv and install dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements.txt
 
       # `python -m`, not bare `pytest`: there is no packaging config, so this
       # is what puts the repo root on sys.path for `import app`.
       - name: Run tests
-        run: python -m pytest
+        run: .venv/bin/python -m pytest
 
   frontend:
     runs-on: ubuntu-22.04
@@ -57,7 +64,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Matches the Node the frontend is developed against; 20 is EOL.
+          node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
