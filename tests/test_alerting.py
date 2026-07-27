@@ -71,6 +71,51 @@ def test_window_rollover_fires_refreshed_exactly_once(tmp_path, recording_notifi
     ]
 
 
+def test_sub_second_reset_jitter_is_not_a_window_rollover(
+    tmp_path, recording_notifier
+):
+    """One window whose id flips by a second must not re-alert.
+
+    Claude reports resets_at as an ISO timestamp with microseconds, and
+    `_normalize_reset_at` truncates it to a whole second. Consecutive reads of
+    the *same* window can land either side of a second boundary, flipping the
+    id by 1. Treating that as a rollover fired REFRESHED at 100% -- claiming
+    quota was available when it was exhausted -- and re-armed EXHAUSTED, so a
+    pinned-at-100% meter alerted on every poll.
+
+    The ids below are the two values observed alternating in a real database.
+    """
+    database, alerts = engine(tmp_path, recording_notifier)
+    alerts.process(meter(99, 1_785_067_799), now=100)
+    assert alerts.process(meter(100, 1_785_067_800), now=101) == ["EXHAUSTED"]
+
+    assert alerts.process(meter(100, 1_785_067_799), now=102) == []
+    assert alerts.process(meter(100, 1_785_067_800), now=103) == []
+    assert alerts.process(meter(100, 1_785_067_799), now=104) == []
+
+    assert [row["event_type"] for row in database.get_events()] == ["EXHAUSTED"]
+    assert len(recording_notifier.calls) == 1
+
+
+def test_genuine_window_rollover_still_fires_after_jitter_tolerance(
+    tmp_path, recording_notifier
+):
+    """A real 5-hour rollover moves resets_at by 18000s and must still alert."""
+    database, alerts = engine(tmp_path, recording_notifier)
+    alerts.process(meter(99, 1_785_049_800), now=100)
+    alerts.process(meter(100, 1_785_049_800), now=101)
+
+    assert alerts.process(meter(100, 1_785_067_800), now=102) == [
+        "REFRESHED",
+        "EXHAUSTED",
+    ]
+    assert [row["event_type"] for row in database.get_events()] == [
+        "EXHAUSTED",
+        "REFRESHED",
+        "EXHAUSTED",
+    ]
+
+
 def test_low_water_refreshes_even_without_window_change(tmp_path, recording_notifier):
     _, alerts = engine(tmp_path, recording_notifier)
     alerts.process(meter(90), now=100)
