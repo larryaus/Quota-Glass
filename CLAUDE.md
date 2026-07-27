@@ -168,6 +168,14 @@ duplicating an alert. Events move `pending → delivered | failed | abandoned`;
 `abandoned` is set by `mark_meter_presence` when a meter vanishes for more than
 one poll, which also forces a reseed so a stale latch cannot fire later.
 
+`Database.get_notification_health` aggregates those statuses for the dashboard.
+It counts `abandoned` but deliberately **excludes it from `last_error`**: a
+vanished meter is an expected provider condition, and treating it as an error
+would leave the poller degraded for the whole retention window every time a
+meter goes away. The poller collects this once per poll into
+`DashboardState.notifications`, so `state()` stays a pure in-memory read — it
+is called on every API request and by the non-blocking refresh path.
+
 The row lifecycle, which spans both files:
 
 ```mermaid

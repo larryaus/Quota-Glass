@@ -87,6 +87,22 @@ class ProviderState(BaseModel):
     model_usage: List[ModelUsageWindow] = Field(default_factory=list)
 
 
+class NotificationHealth(BaseModel):
+    """Delivery state across every event row, not just the current poll.
+
+    A notification that never reached its channel is otherwise invisible: the
+    quota event itself is recorded either way, so a silent SMTP failure looks
+    exactly like a delivered alert.
+    """
+
+    pending: int = 0
+    failed: int = 0
+    abandoned: int = 0
+    last_error: Optional[str] = None
+    last_failure_at: Optional[int] = None
+    last_failure_meter: Optional[str] = None
+
+
 class PollerHealth(BaseModel):
     status: str = "starting"
     running: bool = False
@@ -102,7 +118,28 @@ class PollerHealth(BaseModel):
 class DashboardState(BaseModel):
     providers: List[ProviderState] = Field(default_factory=list)
     poller: PollerHealth = Field(default_factory=PollerHealth)
+    notifications: NotificationHealth = Field(default_factory=NotificationHealth)
     generated_at: str
+
+
+class AlertEventRecord(BaseModel):
+    id: int
+    event_type: str
+    meter_key: str
+    provider: str
+    label: str
+    used_pct: Optional[float] = None
+    window_id: Optional[int] = None
+    created_at: int
+    notification_status: str = "delivered"
+    notification_attempts: int = 0
+    notification_error: Optional[str] = None
+    burn_rate_pct_per_hour: Optional[float] = None
+    projected_exhaustion_at: Optional[int] = None
+
+
+class EventsResponse(BaseModel):
+    events: List[AlertEventRecord] = Field(default_factory=list)
 
 
 class HistorySample(BaseModel):

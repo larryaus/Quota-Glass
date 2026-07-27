@@ -200,6 +200,20 @@ percentage never generate quota alerts. Each detected quota cycle exhausts at
 most once. Quota events and their delivery state are committed to SQLite before
 a notification is attempted, so restarts do not silently lose an alert.
 
+## Delivery diagnostics
+
+A quota event is recorded whether or not its notification reaches you, so a
+misconfigured SMTP server or a rejected `osascript` call would otherwise be
+invisible — the event list looks identical either way.
+
+The dashboard now shows a diagnostics panel whenever the poller reports an
+error or an alert failed to reach its channel, and marks the affected rows in
+the event list. Events move `pending → delivered | failed | abandoned`;
+`abandoned` means the meter disappeared for more than one poll, which is a
+provider condition rather than a delivery failure and is counted separately
+without marking the dashboard degraded. The same counts are on
+`GET /api/health` under `notifications`.
+
 ## Burn rate and projected exhaustion
 
 Every poll stores one sample per meter. Quota Glass reads the trailing
@@ -323,10 +337,12 @@ curl http://127.0.0.1:8000/api/health
   narrow it to one meter, and `bucket_seconds` to collapse the rows into time
   buckets carrying each bucket's peak; without bucketing a 30-day request
   returns every raw sample.
-- `GET /api/events?limit=50` — recent fired alerts
+- `GET /api/events?limit=50` — recent fired alerts, each with its delivery
+  state (`notification_status`, `notification_attempts`, `notification_error`)
 - `POST /api/refresh` — immediate poll; while one is already in flight it
   returns the current state instead of queueing behind it
-- `GET /api/health` — lightweight process health
+- `GET /api/health` — lightweight process health, including poll count, poll
+  duration, and undelivered-notification counts
 
 ## Tests
 

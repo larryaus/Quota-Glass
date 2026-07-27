@@ -85,20 +85,33 @@ type Provider = {
   model_usage: ModelUsageWindow[];
 };
 
+type NotificationHealth = {
+  pending: number;
+  failed: number;
+  abandoned: number;
+  last_error: string | null;
+  last_failure_at: number | null;
+  last_failure_meter: string | null;
+};
+
 type DashboardState = {
   providers: Provider[];
   poller: {
     status: string;
     running: boolean;
     background_task_alive: boolean;
+    last_poll_started: string | null;
     last_poll_completed: string | null;
     last_poll_completed_age_seconds: number | null;
     last_poll_duration_ms: number | null;
     last_error: string | null;
     poll_count: number;
   };
+  notifications: NotificationHealth;
   generated_at: string;
 };
+
+type DeliveryStatus = "delivered" | "pending" | "failed" | "abandoned";
 
 type AlertEvent = {
   id: number;
@@ -108,6 +121,9 @@ type AlertEvent = {
   label: string;
   used_pct: number | null;
   created_at: number;
+  notification_status: DeliveryStatus;
+  notification_attempts: number;
+  notification_error: string | null;
 };
 
 // How much history the sparkline covers, and how coarsely the backend buckets
@@ -634,6 +650,57 @@ function ProviderPanel({
   );
 }
 
+// Delivered is the expected outcome and gets no badge -- only the states that
+// mean the user did not actually receive the alert are called out.
+function deliveryNote(event: AlertEvent): string | null {
+  if (event.notification_status === "delivered") return null;
+  if (event.notification_status === "failed") {
+    return `Not delivered after ${event.notification_attempts} ${
+      event.notification_attempts === 1 ? "attempt" : "attempts"
+    }`;
+  }
+  if (event.notification_status === "abandoned") return "Abandoned";
+  return "Delivery pending";
+}
+
+function Diagnostics({
+  poller,
+  notifications,
+}: {
+  poller: DashboardState["poller"];
+  notifications: NotificationHealth;
+}) {
+  const undelivered = notifications.failed + notifications.abandoned;
+  if (!poller.last_error && undelivered === 0) return null;
+
+  return (
+    <section className="diagnostics" role="status">
+      <header>
+        <span className="eyebrow">Diagnostics</span>
+        <span className="diagnostics-meta">
+          poll #{poller.poll_count}
+          {poller.last_poll_duration_ms !== null &&
+            ` · ${poller.last_poll_duration_ms}ms`}
+        </span>
+      </header>
+      {undelivered > 0 && (
+        <p className="diagnostics-line">
+          <strong>
+            {undelivered} {undelivered === 1 ? "alert" : "alerts"} never reached
+            you
+          </strong>
+          {notifications.failed > 0 && ` · ${notifications.failed} failed`}
+          {notifications.abandoned > 0 &&
+            ` · ${notifications.abandoned} abandoned`}
+          {notifications.last_failure_meter &&
+            ` · most recent: ${notifications.last_failure_meter}`}
+        </p>
+      )}
+      {poller.last_error && <p className="diagnostics-error">{poller.last_error}</p>}
+    </section>
+  );
+}
+
 function eventGlyph(eventType: AlertEvent["event_type"]): string {
   if (eventType === "REFRESHED") return "↻";
   if (eventType === "PROJECTED_EXHAUSTION") return "↗";
@@ -679,6 +746,14 @@ function Events({ events }: { events: AlertEvent[] }) {
                   {eventSummary(event.event_type)}
                   {event.used_pct !== null && ` at ${event.used_pct.toFixed(0)}%`}
                 </p>
+                {deliveryNote(event) && (
+                  <p
+                    className={`delivery delivery-${event.notification_status}`}
+                    title={event.notification_error ?? undefined}
+                  >
+                    {deliveryNote(event)}
+                  </p>
+                )}
               </div>
               <time dateTime={new Date(event.created_at * 1000).toISOString()}>
                 {timeAgo(new Date(event.created_at * 1000).toISOString())}
@@ -796,6 +871,9 @@ export default function App() {
                 {state?.poller.last_poll_completed
                   ? `Checked ${timeAgo(state.poller.last_poll_completed)}`
                   : "Initial poll"}
+                {state !== null &&
+                  state.poller.poll_count > 0 &&
+                  ` · poll #${state.poller.poll_count}`}
               </small>
             </div>
           </div>
@@ -840,6 +918,10 @@ export default function App() {
               />
             ))}
           </div>
+          <Diagnostics
+            poller={state.poller}
+            notifications={state.notifications}
+          />
           <Events events={events} />
         </>
       )}

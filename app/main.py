@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.alerting import AlertEngine
 from app.database import Database
-from app.models import HistoryResponse
+from app.models import EventsResponse, HistoryResponse
 from app.notifier import (
     CompositeNotifier,
     MacOSNotifier,
@@ -96,17 +96,21 @@ def create_app(
 
     @api.get("/api/health")
     async def health(request: Request) -> dict:
-        current = request.app.state.poller.state().poller
+        state = request.app.state.poller.state()
+        current = state.poller
         return {
             "status": current.status,
             "running": current.running,
             "background_task_alive": current.background_task_alive,
             "poll_count": current.poll_count,
+            "last_poll_started": current.last_poll_started,
             "last_poll_completed": current.last_poll_completed,
             "last_poll_completed_age_seconds": (
                 current.last_poll_completed_age_seconds
             ),
+            "last_poll_duration_ms": current.last_poll_duration_ms,
             "last_error": current.last_error,
+            "notifications": state.notifications.model_dump(),
         }
 
     @api.get("/api/state")
@@ -130,14 +134,14 @@ def create_app(
             ),
         )
 
-    @api.get("/api/events")
+    @api.get("/api/events", response_model=EventsResponse)
     async def events(
         request: Request,
         limit: int = Query(default=50, ge=1, le=200),
-    ) -> dict:
-        return {
-            "events": request.app.state.database.get_events(limit),
-        }
+    ) -> EventsResponse:
+        return EventsResponse(
+            events=request.app.state.database.get_events(limit),
+        )
 
     @api.post("/api/refresh")
     async def refresh(request: Request) -> dict:

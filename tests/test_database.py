@@ -199,3 +199,54 @@ def test_schema_migrates_a_database_without_the_new_columns(tmp_path):
     assert len(events) == 1
     assert events[0]["burn_rate_pct_per_hour"] is None
     assert events[0]["notification_status"] == "delivered"
+
+
+def test_notification_health_is_clean_when_everything_delivered(tmp_path):
+    database = Database(tmp_path / "usage.db")
+    database.record_events_and_state(
+        ["EXHAUSTED"], meter(100), 1_800_000_000, 10, 1_800_000_000, 10
+    )
+    for event in database.get_pending_notifications("chatgpt.primary", 3):
+        database.mark_notification_delivered(int(event["id"]))
+
+    health = database.get_notification_health()
+    assert health["pending"] == 0
+    assert health["failed"] == 0
+    assert health["abandoned"] == 0
+    assert health["last_error"] is None
+
+
+def test_notification_health_counts_failures(tmp_path):
+    database = Database(tmp_path / "usage.db")
+    database.record_events_and_state(
+        ["EXHAUSTED"], meter(100), 1_800_000_000, 10, 1_800_000_000, 10
+    )
+    event_id = int(database.get_pending_notifications("chatgpt.primary", 2)[0]["id"])
+    database.mark_notification_failed(event_id, "smtp: connection refused", 2)
+    database.mark_notification_failed(event_id, "smtp: connection refused", 2)
+
+    health = database.get_notification_health()
+    assert health["failed"] == 1
+    assert health["pending"] == 0
+    assert "connection refused" in health["last_error"]
+    assert health["last_failure_meter"] == "chatgpt.primary"
+    assert health["last_failure_at"] == 10
+
+
+def test_abandoned_events_are_counted_but_are_not_an_error(tmp_path):
+    """A vanished meter is a provider condition, not a delivery failure.
+
+    Treating it as an error would leave the dashboard degraded for the whole
+    retention window every time a meter legitimately goes away.
+    """
+    database = Database(tmp_path / "usage.db")
+    database.record_events_and_state(
+        ["EXHAUSTED"], meter(100), 1_800_000_000, 10, 1_800_000_000, 10
+    )
+    database.mark_meter_presence([], ["chatgpt"])
+    database.mark_meter_presence([], ["chatgpt"])
+
+    health = database.get_notification_health()
+    assert health["abandoned"] == 1
+    assert health["last_error"] is None
+    assert health["last_failure_meter"] is None

@@ -185,3 +185,58 @@ def test_history_rejects_out_of_range_arguments(tmp_path, monkeypatch):
         assert client.get("/api/history?hours=721").status_code == 422
         assert client.get("/api/history?bucket_seconds=-1").status_code == 422
         assert client.get("/api/history?bucket_seconds=86401").status_code == 422
+
+
+def test_health_reports_every_poller_field(tmp_path, monkeypatch):
+    """last_poll_started and last_poll_duration_ms exist on PollerHealth and
+    were previously dropped by this endpoint."""
+    application = history_client(tmp_path, monkeypatch)
+
+    with TestClient(application) as client:
+        for _ in range(200):
+            body = client.get("/api/health").json()
+            if body["poll_count"] > 0:
+                break
+            time.sleep(0.005)
+
+    assert body["last_poll_started"] is not None
+    assert body["last_poll_duration_ms"] is not None
+    assert body["notifications"]["failed"] == 0
+    assert body["notifications"]["last_error"] is None
+
+
+def test_events_expose_delivery_state(tmp_path, monkeypatch):
+    application = history_client(tmp_path, monkeypatch)
+    # Must be a current timestamp: the poller prunes events older than
+    # HISTORY_RETENTION_DAYS on its first refresh, which races the insert below.
+    created_at = int(time.time())
+
+    with TestClient(application) as client:
+        database = application.state.database
+        database.record_events_and_state(
+            ["EXHAUSTED"],
+            Meter(
+                key="chatgpt.primary",
+                provider="chatgpt",
+                label="Primary limit",
+                used_pct=100.0,
+                window_minutes=300,
+                resets_at=1_800_000_000,
+                has_quota=True,
+                source="rollout",
+            ),
+            1_800_000_000,
+            created_at,
+            1_800_000_000,
+            created_at,
+        )
+        event_id = int(
+            database.get_pending_notifications("chatgpt.primary", 1)[0]["id"]
+        )
+        database.mark_notification_failed(event_id, "smtp: connection refused", 1)
+        body = client.get("/api/events?limit=5").json()
+
+    event = body["events"][0]
+    assert event["notification_status"] == "failed"
+    assert event["notification_attempts"] == 1
+    assert "connection refused" in event["notification_error"]

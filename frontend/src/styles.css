@@ -898,6 +898,47 @@ code {
   font-weight: 900;
 }
 
+.diagnostics {
+  margin-top: 22px;
+  padding: 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 8px;
+}
+
+.diagnostics header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.diagnostics-meta {
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostics-line {
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+.diagnostics-line strong {
+  color: var(--red);
+}
+
+/* Long provider and SMTP errors arrive as one unbroken string; without this
+   they force the whole page to scroll sideways. */
+.diagnostics-error {
+  font-size: 0.7rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .event-icon.refreshed {
   background: var(--green-soft);
   color: var(--green);
@@ -929,6 +970,23 @@ code {
 
 .events-list time {
   color: var(--muted);
+}
+
+/* Must come after `.events-list p`, and match its specificity, or the muted
+   colour above wins and an undelivered alert reads as ordinary detail. */
+.events-list p.delivery {
+  margin-top: 3px;
+  font-size: 0.66rem;
+  font-weight: 700;
+}
+
+.events-list p.delivery-failed,
+.events-list p.delivery-pending {
+  color: var(--red);
+}
+
+.events-list p.delivery-abandoned {
+  color: var(--amber);
 }
 
 .loading {

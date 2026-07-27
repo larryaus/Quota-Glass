@@ -319,11 +319,30 @@ class Database:
                 (status, attempts, error[:2000], event_id),
             )
 
-    def get_latest_notification_error(self) -> Optional[str]:
+    def get_notification_health(self) -> Dict[str, Any]:
+        """Delivery state across every retained event row.
+
+        `notification_status` is the only record that a notification failed --
+        the quota event is written either way -- so without this a silent SMTP
+        or osascript failure is indistinguishable from a delivered alert.
+        """
         with self._lock:
-            row = self._connection.execute(
+            rows = self._connection.execute(
                 """
-                SELECT notification_error
+                SELECT notification_status AS status, COUNT(*) AS total
+                FROM events
+                WHERE notification_status <> 'delivered'
+                GROUP BY notification_status
+                """
+            ).fetchall()
+            # Deliberately not 'abandoned'. That status means the meter
+            # vanished for more than one poll, which is an expected provider
+            # condition rather than a delivery failure; treating it as an error
+            # would leave the dashboard degraded for the whole retention window
+            # every time a meter legitimately goes away.
+            latest = self._connection.execute(
+                """
+                SELECT meter_key, created_at, notification_error
                 FROM events
                 WHERE notification_status IN ('pending', 'failed')
                   AND notification_error IS NOT NULL
@@ -331,9 +350,21 @@ class Database:
                 LIMIT 1
                 """
             ).fetchone()
-        if row is None:
-            return None
-        return str(row["notification_error"])
+        counts = {str(row["status"]): int(row["total"]) for row in rows}
+        return {
+            "pending": counts.get("pending", 0),
+            "failed": counts.get("failed", 0),
+            "abandoned": counts.get("abandoned", 0),
+            "last_error": (
+                None if latest is None else str(latest["notification_error"])
+            ),
+            "last_failure_at": (
+                None if latest is None else int(latest["created_at"])
+            ),
+            "last_failure_meter": (
+                None if latest is None else str(latest["meter_key"])
+            ),
+        }
 
     def mark_meter_presence(
         self,

@@ -7,7 +7,13 @@ from typing import List, Optional
 from app.alerting import AlertEngine
 from app.database import Database
 from app.history import projection_for, window_start
-from app.models import DashboardState, Meter, PollerHealth, ProviderState
+from app.models import (
+    DashboardState,
+    Meter,
+    NotificationHealth,
+    PollerHealth,
+    ProviderState,
+)
 from app.providers.chatgpt import parse_chatgpt
 from app.providers.claude import ClaudeOAuthCache, parse_claude
 from app.providers.live_cache import LiveSourceCache
@@ -30,6 +36,7 @@ class UsagePoller:
         self.alert_engine = alert_engine
         self.providers: List[ProviderState] = []
         self.health = PollerHealth()
+        self.notifications = NotificationHealth()
         # These signals may be touched by an ASGI lifespan task and an
         # immediate manual-refresh request. Threading primitives avoid binding
         # the poller to whichever event loop happens to touch them first on
@@ -156,11 +163,19 @@ class UsagePoller:
                     except Exception as exc:
                         errors.append("History retention failed: %s" % exc)
 
-                notification_error = await asyncio.to_thread(
-                    self.database.get_latest_notification_error
-                )
-                if notification_error is not None:
-                    errors.append(notification_error)
+                # Collected here, once per poll, so `state()` stays a pure
+                # in-memory read -- it is called on every API request and by
+                # the non-blocking refresh path.
+                try:
+                    self.notifications = NotificationHealth(
+                        **await asyncio.to_thread(
+                            self.database.get_notification_health
+                        )
+                    )
+                except Exception as exc:
+                    errors.append("Notification health lookup failed: %s" % exc)
+                if self.notifications.last_error is not None:
+                    errors.append(self.notifications.last_error)
                 self.health.status = "degraded" if errors else "healthy"
                 self.health.last_error = "; ".join(errors) if errors else None
             except Exception as exc:
@@ -218,6 +233,7 @@ class UsagePoller:
         return DashboardState(
             providers=self.providers,
             poller=self.health,
+            notifications=self.notifications,
             generated_at=_iso_now(),
         )
 

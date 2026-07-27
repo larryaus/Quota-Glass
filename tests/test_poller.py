@@ -424,7 +424,9 @@ async def test_poll_attaches_a_projection_and_alerts_on_it(monkeypatch, tmp_path
 
     projection = state.providers[0].meters[0].projection
     assert projection is not None
-    assert projection.burn_rate_pct_per_hour == 40.0
+    # Approximate: the poll reads its own wall clock, so the span can land a
+    # second either side of the seeded 1800.
+    assert projection.burn_rate_pct_per_hour == pytest.approx(40.0, abs=0.1)
     assert projection.exhausts_before_reset is True
     assert [row["event_type"] for row in database.get_events()] == [
         "PROJECTED_EXHAUSTION"
@@ -465,4 +467,64 @@ async def test_burn_rate_can_be_disabled(monkeypatch, tmp_path):
 
     assert state.providers[0].meters[0].projection is None
     assert database.get_events() == []
+    assert state.poller.status == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_surfaces_in_notification_health(monkeypatch, tmp_path):
+    """A notification that never sent must be visible in the dashboard state.
+
+    The quota event is recorded either way, so without this a silent SMTP or
+    osascript failure is indistinguishable from a delivered alert.
+    """
+    class AlwaysFail:
+        def notify(self, title, subtitle, message):
+            raise RuntimeError("smtp: connection refused")
+
+    def chatgpt(*args, **kwargs):
+        return ProviderState(
+            key="chatgpt",
+            label="ChatGPT",
+            mode="rollout",
+            meters=[quota_meter("chatgpt", 100.0)],
+        )
+
+    async def claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", claude)
+    settings = poller_settings(tmp_path)
+    database = Database(settings.database_path)
+    alerts = AlertEngine(database, AlwaysFail(), 100.0, 5.0, max_notification_attempts=1)
+    alerts.process(quota_meter("chatgpt", 90.0), now=100)
+    poller = UsagePoller(settings, database, alerts)
+
+    state = await poller.refresh()
+
+    assert state.notifications.failed == 1
+    assert "connection refused" in state.notifications.last_error
+    assert state.notifications.last_failure_meter == "chatgpt.primary"
+    assert state.poller.status == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_notification_health_is_clean_on_a_quiet_poll(monkeypatch, tmp_path):
+    def chatgpt(*args, **kwargs):
+        return ProviderState(key="chatgpt", label="ChatGPT", mode="local")
+
+    async def claude(*args, **kwargs):
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", claude)
+    settings = poller_settings(tmp_path)
+    database = Database(settings.database_path)
+    poller = UsagePoller(settings, database, AlertEngine(database, NullNotifier()))
+
+    state = await poller.refresh()
+
+    assert state.notifications.failed == 0
+    assert state.notifications.abandoned == 0
+    assert state.notifications.last_error is None
     assert state.poller.status == "healthy"
