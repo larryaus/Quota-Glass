@@ -2,8 +2,9 @@
 
 Quota Glass is a private, single-user macOS dashboard for Claude and ChatGPT
 subscription usage. It combines quota gauges and reset countdowns with local
-token estimates, per-model effort breakdowns, credits, provider health, and a
-durable alert history.
+token estimates, 24-hour and 7-day quota history, burn-rate projections,
+per-model effort breakdowns, credits, provider health, and a durable alert
+history.
 
 Local usage files are the default data source. Live ChatGPT quota, Claude OAuth,
 and email delivery are separate opt-ins; the core dashboard needs no provider

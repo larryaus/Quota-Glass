@@ -126,11 +126,17 @@ type AlertEvent = {
   notification_error: string | null;
 };
 
-// How much history the sparkline covers, and how coarsely the backend buckets
-// it. Six hours at five-minute buckets is ~72 points per meter -- enough shape
-// to read a trend, small enough to re-fetch on every 15s poll.
-const HISTORY_HOURS = 6;
-const HISTORY_BUCKET_SECONDS = 300;
+type HistoryRangeHours = 24 | 168;
+
+// A single seven-day request feeds both ranges. Thirty-minute buckets retain
+// 48 points for the 24-hour view and 336 for the seven-day view per meter,
+// while keeping the payload small enough to re-fetch on every 15s poll.
+const HISTORY_HOURS = 168;
+const HISTORY_BUCKET_SECONDS = 1800;
+const HISTORY_RANGES: { hours: HistoryRangeHours; label: string }[] = [
+  { hours: 24, label: "24h" },
+  { hours: 168, label: "7d" },
+];
 
 // Matches app/providers/usage.py: the label for records that named no effort.
 const UNSPECIFIED_EFFORT = "unspecified";
@@ -199,34 +205,66 @@ function shortDuration(seconds: number): string {
   return `${minutes}m`;
 }
 
-// A polyline over the meter's own min/max, so a series that only moves a few
-// percent still shows its shape. The width is normalised to the full time span
-// rather than to sample index, so a gap in polling reads as a gap.
-function Sparkline({ points, label }: { points: HistorySample[]; label: string }) {
-  const usable = points.filter(
-    (point): point is HistorySample & { used_pct: number } => point.used_pct !== null,
-  );
-  if (usable.length < 2) return null;
+type UsableHistorySample = HistorySample & { used_pct: number };
+
+// Each polyline uses the meter's own min/max, so a series that moves only a few
+// percent still shows its shape. Time is fixed to the selected range rather
+// than normalised to the available samples, so a new installation does not
+// make ten minutes of readings look like a full day.
+function Sparkline({
+  points,
+  label,
+  hours,
+  now,
+}: {
+  points: HistorySample[];
+  label: string;
+  hours: HistoryRangeHours;
+  now: number;
+}) {
+  const end = now / 1000;
+  const start = end - hours * 3600;
+  const segments: UsableHistorySample[][] = [];
+  let current: UsableHistorySample[] = [];
+
+  for (const point of points) {
+    if (point.sampled_at < start || point.sampled_at > end) continue;
+    if (point.used_pct === null || point.stale) {
+      if (current.length > 0) segments.push(current);
+      current = [];
+      continue;
+    }
+    current.push(point as UsableHistorySample);
+  }
+  if (current.length > 0) segments.push(current);
+
+  const usable = segments.flat();
+  if (usable.length < 2) {
+    return (
+      <div className="sparkline-empty">
+        Fresh readings collected during this period will appear here.
+      </div>
+    );
+  }
 
   const values = usable.map((point) => point.used_pct);
-  const times = usable.map((point) => point.sampled_at);
   const lowest = Math.min(...values);
   const highest = Math.max(...values);
-  const earliest = Math.min(...times);
-  const latest = Math.max(...times);
-  const timeSpan = latest - earliest || 1;
   // Keep a floor on the vertical range so a flat series draws a flat line
   // through the middle instead of amplifying rounding noise into a sawtooth.
   const valueSpan = Math.max(highest - lowest, 5);
   const floor = highest - valueSpan;
 
-  const coordinates = usable
-    .map((point) => {
-      const x = ((point.sampled_at - earliest) / timeSpan) * 100;
-      const y = 22 - ((point.used_pct - floor) / valueSpan) * 20;
-      return `${x.toFixed(2)},${y.toFixed(2)}`;
-    })
-    .join(" ");
+  const coordinates = segments.map((segment) =>
+    segment
+      .map((point) => {
+        const x = ((point.sampled_at - start) / (end - start)) * 100;
+        const y = 22 - ((point.used_pct - floor) / valueSpan) * 20;
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+      })
+      .join(" "),
+  );
+  const rangeLabel = hours === 24 ? "24 hours" : "7 days";
 
   return (
     <svg
@@ -236,9 +274,11 @@ function Sparkline({ points, label }: { points: HistorySample[]; label: string }
       role="img"
       aria-label={`${label}: ${lowest.toFixed(0)} to ${highest.toFixed(
         0,
-      )} percent over the last ${shortDuration(timeSpan)}`}
+      )} percent over the last ${rangeLabel}`}
     >
-      <polyline points={coordinates} />
+      {coordinates.map((segment, index) => (
+        <polyline key={`${segment}-${index}`} points={segment} />
+      ))}
     </svg>
   );
 }
@@ -292,6 +332,7 @@ function Gauge({
   now: number;
   history: HistorySample[];
 }) {
+  const [historyHours, setHistoryHours] = useState<HistoryRangeHours>(24);
   const value = meter.used_pct === null ? 0 : Math.min(100, Math.max(0, meter.used_pct));
   const gaugeStyle = {
     "--meter-value": `${value * 3.6}deg`,
@@ -339,7 +380,36 @@ function Gauge({
         </div>
       </div>
       <div className="meter-trend">
-        <Sparkline points={history} label={meter.label} />
+        <div className="meter-history-header">
+          <span>Usage history</span>
+          <div
+            className="history-range"
+            role="group"
+            aria-label={`${meter.label} history range`}
+          >
+            {HISTORY_RANGES.map((range) => (
+              <button
+                key={range.hours}
+                type="button"
+                className={historyHours === range.hours ? "active" : ""}
+                aria-pressed={historyHours === range.hours}
+                onClick={() => setHistoryHours(range.hours)}
+              >
+                {range.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <Sparkline
+          points={history}
+          label={meter.label}
+          hours={historyHours}
+          now={now}
+        />
+        <div className="history-axis" aria-hidden="true">
+          <span>{historyHours === 24 ? "24h ago" : "7d ago"}</span>
+          <span>Now</span>
+        </div>
         <BurnRate meter={meter} now={now} />
       </div>
     </article>
