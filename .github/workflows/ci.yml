@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the in-flight run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the version the project actually targets (see CLAUDE.md: no
+        # `X | Y` unions, no `asyncio.timeout`). A contributor's machine will
+        # usually have something newer, so without this job a 3.10-only
+        # construct passes locally and only breaks for the user. 3.12 guards
+        # the other direction.
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # tests/test_run_script.py extracts functions out of run.sh and executes
+      # them; port_holder() shells out to lsof to name the process holding a
+      # port. Present on the runner image today, installed explicitly so a
+      # future image change surfaces as an apt error rather than a puzzling
+      # assertion failure.
+      - name: Install lsof
+        run: sudo apt-get install -y --no-install-recommends lsof
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # `python -m`, not bare `pytest`: there is no packaging config, so this
+      # is what puts the repo root on sys.path for `import app`.
+      - name: Run tests
+        run: python -m pytest
+
+  frontend:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
