@@ -1,17 +1,35 @@
 # Quota Glass
 
 Quota Glass is a private, single-user macOS dashboard for Claude and ChatGPT
-subscription usage. A React frontend displays quota gauges, refresh countdowns,
-local token estimates, model-by-model token percentages split by effort level,
-credits, provider errors, and recent alert events.
-A FastAPI process reads local usage files, persists samples and alert state in
-SQLite, and uses built-in `osascript` notifications when a quota is exhausted
-and when it refreshes. Optional SMTP email notifications can deliver the same
-alerts away from the Mac running Quota Glass.
+subscription usage. It combines quota gauges and reset countdowns with local
+token estimates, per-model effort breakdowns, credits, provider health, and a
+durable alert history.
 
-The dashboard and its data stay local. Email, Claude OAuth, and live ChatGPT
-quota are opt-in network features. No provider API key or vendor billing
-organization is needed for the core dashboard.
+Local usage files are the default data source. Live ChatGPT quota, Claude OAuth,
+and email delivery are separate opt-ins; the core dashboard needs no provider
+API key or vendor billing account.
+
+## Quick start
+
+You need macOS, Python 3.9, Node.js, and npm. From this repository:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cd frontend
+npm install
+cd ..
+./run.sh
+```
+
+Open [http://localhost:5173](http://localhost:5173). The backend and frontend
+listen only on `127.0.0.1`; stop both with `Ctrl-C`.
+
+Quota Glass can start before it finds usage records. Run at least one Codex or
+Claude Code turn to populate the corresponding local source, then use the
+dashboard's **Refresh now** control. No Homebrew, `uv`, Poetry, `pipx`,
+`terminal-notifier`, API key, or system-wide Python package installation is
+required.
 
 ## Architecture
 
@@ -53,17 +71,24 @@ flowchart TB
 ```
 
 Solid arrows are always on and never leave the machine. Dashed arrows are the
-opt-in paths: each is off by default, and with all of them off Quota Glass makes
-no network call, spawns no subprocess, and never touches Keychain.
+opt-in data paths. With both live sources disabled, Quota Glass makes no
+provider data request, starts no live-source subprocess, and never reads
+Keychain. Local macOS alerts still use the built-in `osascript` command when an
+alert fires.
 
 ## Data sources
+
+| Provider | Default source | Optional live source | Alert eligibility |
+| --- | --- | --- | --- |
+| ChatGPT | Codex rollout files | Codex CLI `app-server` | Fresh quota readings only; stale readings never alert |
+| Claude | Claude Code assistant records | Undocumented Claude OAuth endpoint | Live quota readings only; local estimates never alert |
 
 - **ChatGPT:** reads the newest usable `token_count` snapshot from
   `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. The percentage comes directly
   from Codex's local rate-limit snapshot. Because Codex only updates it during a
-  turn, readings older than 30 minutes are marked stale and never alert. Model
-  mix is calculated from each turn's token delta and the active rollout model
-  and reasoning effort.
+  turn, readings older than `STALE_AFTER_MINUTES` (30 by default) are marked
+  stale and never alert. Model mix is calculated from each turn's token delta
+  and the active rollout model and reasoning effort.
 - **Claude (default):** reads assistant usage records under
   `~/.claude/projects/**/*.jsonl` and aggregates rolling 5-hour and 7-day token
   totals and model mix, split by the effort recorded on each assistant turn.
@@ -79,59 +104,47 @@ being assigned a guess.
 The SQLite database is created at `./data/usage.db`. Alert latches survive app
 restarts, preventing duplicate notifications.
 
-## Requirements
-
-- macOS with `/usr/bin/osascript`
-- Python 3.9
-- Node.js and npm
-
-No Homebrew, `uv`, Poetry, `pipx`, `terminal-notifier`, API key, or system-wide
-Python package installation is required.
-
-## Setup
-
-From this repository:
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cd frontend
-npm install
-cd ..
-```
-
-## Run
-
-```bash
-./run.sh
-```
-
-Open [http://localhost:5173](http://localhost:5173). The backend listens only on
-`127.0.0.1:8000`; Vite proxies `/api` to it. Stop both processes with `Ctrl-C`.
-
 ## Configuration
 
 Set environment variables before running `./run.sh`:
 
+### Live sources
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ENABLE_CLAUDE_OAUTH` | `0` | Opt into Claude's undocumented live quota source. |
-| `POLL_INTERVAL_SECONDS` | `60` | Backend poll interval. |
 | `OAUTH_MIN_INTERVAL_SECONDS` | `300` | Minimum interval between Claude OAuth usage requests. |
-| `OAUTH_MAX_BACKOFF_SECONDS` | `3600` | Ceiling for exponential Claude OAuth rate-limit backoff. |
-| `ALERT_THRESHOLD_PCT` | `100` | Percentage crossing that fires `EXHAUSTED`. |
-| `ALERT_RESET_PCT` | `5` | Low-water percentage that confirms `REFRESHED`. |
-| `STALE_AFTER_MINUTES` | `30` | Age after which a Codex snapshot is stale. |
-| `CHATGPT_CANDIDATE_FILES` | `5` | Recent rollout files compared by snapshot timestamp. |
 | `ENABLE_CHATGPT_LIVE` | `0` | Opt into live ChatGPT quota via the Codex CLI. |
 | `CHATGPT_LIVE_MIN_INTERVAL_SECONDS` | `300` | Minimum interval between Codex CLI usage reads. |
+| `OAUTH_MAX_BACKOFF_SECONDS` | `3600` | Maximum exponential backoff used by both live-source caches. |
 | `CODEX_CLI_PATH` | `codex` | Path to the Codex CLI executable. |
 | `CODEX_CLI_TIMEOUT_SECONDS` | `20` | Timeout for a single Codex CLI read. |
-| `HISTORY_RETENTION_DAYS` | `30` | Retention period for SQLite samples and events. |
-| `MAX_NOTIFICATION_ATTEMPTS` | `3` | Delivery attempts allowed for each notification. |
+
+### Local sources and freshness
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
 | `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | Injectable Codex rollout root. |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Injectable Claude project root. |
+| `STALE_AFTER_MINUTES` | `30` | Age after which a local Codex quota snapshot is stale. |
+| `CHATGPT_CANDIDATE_FILES` | `5` | Number of recent usable Codex snapshots compared by timestamp. |
+
+### Polling, alerts, and storage
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `POLL_INTERVAL_SECONDS` | `60` | Backend poll interval. |
+| `ALERT_THRESHOLD_PCT` | `100` | Percentage crossing that fires `EXHAUSTED`. |
+| `ALERT_RESET_PCT` | `5` | Low-water percentage that confirms `REFRESHED`. |
+| `HISTORY_RETENTION_DAYS` | `30` | Retention period for SQLite samples and events. |
+| `MAX_NOTIFICATION_ATTEMPTS` | `3` | Delivery attempts allowed for each notification. |
 | `NOTIFICATIONS_ENABLED` | `1` | Set to `0` to suppress macOS notifications. |
+| `DATABASE_PATH` | `./data/usage.db` | SQLite file location. |
+
+### Email delivery
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
 | `EMAIL_NOTIFICATIONS_ENABLED` | `0` | Set to `1` to send alert emails over SMTP. |
 | `EMAIL_TO` | empty | Comma-separated alert recipients; required for email. |
 | `EMAIL_FROM` | `SMTP_USERNAME` | Sender address; required when the SMTP username is not an email address or authentication is disabled. |
@@ -141,7 +154,6 @@ Set environment variables before running `./run.sh`:
 | `SMTP_PASSWORD` | empty | SMTP password or provider-issued app password. |
 | `SMTP_SECURITY` | `starttls` | Transport security: `starttls`, `ssl`, or `none`. |
 | `SMTP_TIMEOUT_SECONDS` | `10` | Timeout for an SMTP connection and send. |
-| `DATABASE_PATH` | `./data/usage.db` | SQLite file location. |
 
 Example:
 
@@ -149,15 +161,26 @@ Example:
 POLL_INTERVAL_SECONDS=30 NOTIFICATIONS_ENABLED=0 ./run.sh
 ```
 
+## Alert behavior
+
+The first valid reading for a meter establishes a baseline. Later fresh quota
+readings generate:
+
+- **Quota exhausted** when usage crosses `ALERT_THRESHOLD_PCT` from below.
+- **Quota refreshed** after an exhaustion when the quota window rolls over or
+  usage drops far enough to indicate a reset. `ALERT_RESET_PCT` catches a reset
+  whose first new-window reading is already slightly above zero.
+
+Stale readings, local Claude estimates, and any other meter without a quota
+percentage never generate quota alerts. Each detected quota cycle exhausts at
+most once. Quota events and their delivery state are committed to SQLite before
+a notification is attempted, so restarts do not silently lose an alert.
+
 ## Email alerts
 
-Email notifications use the existing durable quota events: crossing from below
-the configured threshold to 100% sends **Quota exhausted**, and the first
-low-water reading after exhaustion sends **Quota refreshed**. A normal reset is
-reported at 0%; `ALERT_RESET_PCT=5` also catches the reset when the first
-post-reset poll has already risen slightly above zero. Each quota window alerts
-only once, and failed SMTP deliveries use the same retry limit as macOS
-notifications.
+Email notifications deliver the same durable events as macOS notifications.
+Failed SMTP deliveries use `MAX_NOTIFICATION_ATTEMPTS`, just like failed local
+notification deliveries.
 
 Export your SMTP settings in the shell that starts Quota Glass:
 
@@ -224,7 +247,7 @@ Any failure (CLI missing, logged out, timeout, or a protocol change) falls back
 to parsing Codex session files on disk, which is the default behaviour. A
 previously successful reading stays visible as a cached value during backoff.
 With `ENABLE_CHATGPT_LIVE=0`, no subprocess is spawned and no network call is
-made.
+made by the ChatGPT provider.
 
 ## Cost estimates and billing
 
@@ -232,6 +255,23 @@ Claude dollar figures are rough API-equivalent estimates calculated from a
 small hardcoded per-model price table. They are not subscription spend and may
 not match current pricing. **Quota Glass does not use a vendor billing API** and
 does not have access to either provider's billing records.
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| No local usage appears | Run a Codex or Claude Code turn, refresh the dashboard, and confirm `CODEX_SESSIONS_DIR` or `CLAUDE_PROJECTS_DIR` points at the client's actual data directory. |
+| ChatGPT is marked stale | Codex updates its local quota snapshot during turns. Run a new turn, or enable the live ChatGPT source. Stale readings intentionally do not alert. |
+| Claude shows estimates instead of percentages | This is expected in local mode: Claude Code records contain token usage, not subscription quota. Live percentages require the unsupported OAuth opt-in. |
+| A live source falls back to local data | Read the provider error shown on the dashboard. For ChatGPT, check that `codex` is installed, logged in, and reachable through `CODEX_CLI_PATH`. For Claude, the internal endpoint or Keychain item may have changed. |
+| `./run.sh` reports port 8000 in use | Quota Glass may already be running. Open the shown dashboard URL or stop the process identified by the script before restarting. |
+| Email configuration fails at startup | Set `EMAIL_TO`, `SMTP_HOST`, and either `EMAIL_FROM` or `SMTP_USERNAME`. Set `SMTP_USERNAME` and `SMTP_PASSWORD` together, or leave both empty for an unauthenticated relay. |
+
+For a lightweight backend check:
+
+```bash
+curl http://127.0.0.1:8000/api/health
+```
 
 ## API
 
