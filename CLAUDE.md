@@ -121,7 +121,11 @@ naming none land under `UNSPECIFIED_EFFORT` and are never guessed at.
 
 `EXHAUSTED` fires on crossing `ALERT_THRESHOLD_PCT`; `REFRESHED` fires on window
 rollover, a usage drop past `RESET_DROP_EPSILON_PCT`, or a reading below
-`ALERT_RESET_PCT`. The latch (`meter_state.fired_full_for_window`) and the event
+`ALERT_RESET_PCT`. Window identity is deliberately **not** exact equality:
+`resets_at` is truncated to a whole second from a microsecond timestamp, so two
+reads of one window can differ by 1. `_window_changed` ignores differences
+within `WINDOW_JITTER_TOLERANCE_SECONDS`; a real rollover moves the reset by a
+whole window, so the two are never ambiguous. The latch (`meter_state.fired_full_for_window`) and the event
 rows are written in **one transaction before any notification is attempted**, so
 a crash mid-delivery retries the same row after restart rather than losing or
 duplicating an alert. Events move `pending → delivered | failed | abandoned`;

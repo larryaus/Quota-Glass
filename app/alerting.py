@@ -8,6 +8,12 @@ from app.notifier import Notifier
 
 RESET_DROP_EPSILON_PCT = 10.0
 DEFAULT_MAX_NOTIFICATION_ATTEMPTS = 3
+# Reset timestamps are not stable to the second. Claude reports resets_at with
+# microsecond precision and it is truncated to a whole second, so two reads of
+# one window can straddle a second boundary and differ by 1. A genuine rollover
+# moves the reset by a whole window -- five hours at the shortest -- so a
+# difference this small is jitter, never a new window.
+WINDOW_JITTER_TOLERANCE_SECONDS = 120
 
 
 class AlertEngine:
@@ -19,6 +25,7 @@ class AlertEngine:
         reset_pct: float = 5.0,
         reset_drop_epsilon_pct: float = RESET_DROP_EPSILON_PCT,
         max_notification_attempts: int = DEFAULT_MAX_NOTIFICATION_ATTEMPTS,
+        window_jitter_tolerance_seconds: int = WINDOW_JITTER_TOLERANCE_SECONDS,
     ) -> None:
         self.database = database
         self.notifier = notifier
@@ -26,7 +33,24 @@ class AlertEngine:
         self.reset_pct = reset_pct
         self.reset_drop_epsilon_pct = reset_drop_epsilon_pct
         self.max_notification_attempts = max(1, max_notification_attempts)
+        self.window_jitter_tolerance_seconds = max(
+            0,
+            window_jitter_tolerance_seconds,
+        )
         self.last_errors: List[str] = []
+
+    def _window_changed(
+        self,
+        previous: Optional[int],
+        current: Optional[int],
+    ) -> bool:
+        """True only when the reset moved further than jitter can explain."""
+        if previous is None or current is None:
+            return (previous is None) != (current is None)
+        return (
+            abs(int(previous) - int(current))
+            > self.window_jitter_tolerance_seconds
+        )
 
     def process(self, meter: Meter, now: Optional[int] = None) -> List[str]:
         self.last_errors = []
@@ -52,7 +76,7 @@ class AlertEngine:
         last_event_at = state["last_event_at"]
         events: List[str] = []
 
-        window_changed = state["window_id"] != current_window
+        window_changed = self._window_changed(state["window_id"], current_window)
         usage_drop = (
             previous_pct is not None
             and float(previous_pct) - meter.used_pct
