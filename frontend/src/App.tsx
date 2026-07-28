@@ -16,7 +16,7 @@ type Meter = {
   window_minutes: number | null;
   resets_at: number | null;
   has_quota: boolean;
-  source: "rollout" | "oauth" | "local" | "app-server";
+  source: "rollout" | "oauth" | "local" | "app-server" | "statusline";
   stale: boolean;
   projection: MeterProjection | null;
 };
@@ -674,8 +674,9 @@ function ProviderPanel({
           {provider.key === "claude" ? (
             <p>
               Claude’s local records provide token and cost estimates, not quota
-              percentages. Set <code>ENABLE_CLAUDE_OAUTH=1</code> before starting
-              the app to opt into the fragile live-percentage source.
+              percentages. Configure the Claude Code status-line bridge and set{" "}
+              <code>ENABLE_CLAUDE_STATUSLINE=1</code> before starting the app to
+              read live percentages without handling OAuth tokens.
             </p>
           ) : (
             <p>

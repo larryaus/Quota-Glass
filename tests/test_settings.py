@@ -1,4 +1,40 @@
+from pathlib import Path
+
 from app.settings import Settings
+
+
+def test_claude_statusline_defaults_off(monkeypatch):
+    for name in (
+        "ENABLE_CLAUDE_STATUSLINE",
+        "CLAUDE_STATUS_SNAPSHOT_PATH",
+        "CLAUDE_STATUS_STALE_AFTER_MINUTES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings()
+
+    assert settings.enable_claude_statusline is False
+    assert settings.claude_status_snapshot_path == (
+        Path.home()
+        / "Library"
+        / "Caches"
+        / "QuotaGlass"
+        / "claude-rate-limits.json"
+    )
+    assert settings.claude_status_stale_after_minutes == 30
+
+
+def test_claude_statusline_reads_environment(monkeypatch, tmp_path):
+    snapshot = tmp_path / "claude.json"
+    monkeypatch.setenv("ENABLE_CLAUDE_STATUSLINE", "1")
+    monkeypatch.setenv("CLAUDE_STATUS_SNAPSHOT_PATH", str(snapshot))
+    monkeypatch.setenv("CLAUDE_STATUS_STALE_AFTER_MINUTES", "45")
+
+    settings = Settings()
+
+    assert settings.enable_claude_statusline is True
+    assert settings.claude_status_snapshot_path == snapshot
+    assert settings.claude_status_stale_after_minutes == 45
 
 
 def test_chatgpt_live_defaults_off(monkeypatch):

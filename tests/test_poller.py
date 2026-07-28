@@ -281,6 +281,43 @@ async def test_poller_passes_live_settings_to_chatgpt(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_poller_passes_statusline_settings_to_claude(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    def working_chatgpt(*args, **kwargs):
+        return ProviderState(key="chatgpt", label="ChatGPT", mode="local")
+
+    async def fake_claude(*args, **kwargs):
+        captured.update(kwargs)
+        return ProviderState(key="claude", label="Claude", mode="local")
+
+    monkeypatch.setattr("app.poller.parse_chatgpt", working_chatgpt)
+    monkeypatch.setattr("app.poller.parse_claude", fake_claude)
+    snapshot = tmp_path / "claude-status.json"
+    settings = poller_settings(
+        tmp_path,
+        enable_claude_statusline=True,
+        claude_status_snapshot_path=snapshot,
+        claude_status_stale_after_minutes=45,
+    )
+    database = Database(settings.database_path)
+    poller = UsagePoller(
+        settings,
+        database,
+        AlertEngine(database, NullNotifier()),
+    )
+
+    await poller.refresh()
+
+    assert captured["enable_statusline"] is True
+    assert captured["statusline_snapshot_path"] == snapshot
+    assert captured["statusline_stale_after_minutes"] == 45
+
+
+@pytest.mark.asyncio
 async def test_concurrent_refresh_returns_current_state_instead_of_queueing(
     monkeypatch,
     tmp_path,

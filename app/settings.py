@@ -34,6 +34,9 @@ class Settings:
     def __init__(
         self,
         enable_claude_oauth: Optional[bool] = None,
+        enable_claude_statusline: Optional[bool] = None,
+        claude_status_snapshot_path: Optional[Path] = None,
+        claude_status_stale_after_minutes: Optional[int] = None,
         poll_interval_seconds: Optional[int] = None,
         alert_threshold_pct: Optional[float] = None,
         alert_reset_pct: Optional[float] = None,
@@ -72,6 +75,30 @@ class Settings:
             _bool_env("ENABLE_CLAUDE_OAUTH", False)
             if enable_claude_oauth is None
             else enable_claude_oauth
+        )
+        self.enable_claude_statusline = (
+            _bool_env("ENABLE_CLAUDE_STATUSLINE", False)
+            if enable_claude_statusline is None
+            else enable_claude_statusline
+        )
+        self.claude_status_snapshot_path = (
+            Path(
+                os.path.expanduser(
+                    os.getenv(
+                        "CLAUDE_STATUS_SNAPSHOT_PATH",
+                        "~/Library/Caches/QuotaGlass/"
+                        "claude-rate-limits.json",
+                    )
+                )
+            )
+            if claude_status_snapshot_path is None
+            else Path(claude_status_snapshot_path)
+        )
+        self.claude_status_stale_after_minutes = max(
+            1,
+            _int_env("CLAUDE_STATUS_STALE_AFTER_MINUTES", 30)
+            if claude_status_stale_after_minutes is None
+            else claude_status_stale_after_minutes,
         )
         self.poll_interval_seconds = max(
             1,

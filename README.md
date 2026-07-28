@@ -6,9 +6,10 @@ token estimates, 24-hour and 7-day quota history, burn-rate projections,
 per-model effort breakdowns, credits, provider health, and a durable alert
 history.
 
-Local usage files are the default data source. Live ChatGPT quota, Claude OAuth,
-and email delivery are separate opt-ins; the core dashboard needs no provider
-API key or vendor billing account.
+Local usage files are the default data source. Live ChatGPT quota, the Claude
+Code status-line bridge, legacy Claude OAuth, and email delivery are separate
+opt-ins; the core dashboard needs no provider API key or vendor billing
+account.
 
 ## Quick start
 
@@ -43,6 +44,7 @@ flowchart TB
 
     subgraph optin["Opt-in — off by default"]
         codexCli["codex app-server<br/>ENABLE_CHATGPT_LIVE"]
+        claudeStatus["Claude Code status-line snapshot<br/>ENABLE_CLAUDE_STATUSLINE"]
         anthropic["api.anthropic.com<br/>ENABLE_CLAUDE_OAUTH"]
         keychain["macOS Keychain<br/>token, per request only"]
     end
@@ -61,6 +63,7 @@ flowchart TB
     codexFiles --> poller
     claudeFiles --> poller
     codexCli -.-> poller
+    claudeStatus -.-> poller
     keychain -.-> anthropic
     anthropic -.-> poller
 
@@ -76,7 +79,7 @@ flowchart TB
 ```
 
 Solid arrows are always on and never leave the machine. Dashed arrows are the
-opt-in data paths. With both live sources disabled, Quota Glass makes no
+opt-in data paths. With every live source disabled, Quota Glass makes no
 provider data request, starts no live-source subprocess, and never reads
 Keychain. Local macOS alerts still use the built-in `osascript` command when an
 alert fires.
@@ -86,7 +89,7 @@ alert fires.
 | Provider | Default source | Optional live source | Alert eligibility |
 | --- | --- | --- | --- |
 | ChatGPT | Codex rollout files | Codex CLI `app-server` | Fresh quota readings only; stale readings never alert |
-| Claude | Claude Code assistant records | Undocumented Claude OAuth endpoint | Live quota readings only; local estimates never alert |
+| Claude | Claude Code assistant records | Claude Code status-line bridge (recommended) or undocumented OAuth (legacy) | Fresh quota readings only; stale readings and local estimates never alert |
 
 - **ChatGPT:** reads the newest usable `token_count` snapshot from
   `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. The percentage comes directly
@@ -99,6 +102,11 @@ alert fires.
   totals and model mix, split by the effort recorded on each assistant turn.
   These local records do not contain subscription quota percentages, so the
   dashboard labels them as estimates and never alerts on them.
+- **Claude (status-line bridge):** Claude Code passes its documented 5-hour and
+  7-day subscription percentages and reset timestamps to a local status-line
+  command. The included collector stores only those quota fields in a private
+  cache file. Quota Glass never handles the OAuth token or calls Anthropic when
+  this source is used.
 
 Both providers report the 5-hour and 7-day model mix as a per-model effort
 breakdown: model percentages are shares of the window, and effort percentages
@@ -117,6 +125,9 @@ Set environment variables before running `./run.sh`:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `ENABLE_CLAUDE_STATUSLINE` | `0` | Read live Claude quota from the local Claude Code status-line snapshot. |
+| `CLAUDE_STATUS_SNAPSHOT_PATH` | `~/Library/Caches/QuotaGlass/claude-rate-limits.json` | Shared path written by the collector and read by Quota Glass. |
+| `CLAUDE_STATUS_STALE_AFTER_MINUTES` | `30` | Age after which a Claude status-line quota snapshot is stale and cannot alert. |
 | `ENABLE_CLAUDE_OAUTH` | `0` | Opt into Claude's undocumented live quota source. |
 | `OAUTH_MIN_INTERVAL_SECONDS` | `300` | Minimum interval between Claude OAuth usage requests. |
 | `ENABLE_CHATGPT_LIVE` | `0` | Opt into live ChatGPT quota via the Codex CLI. |
@@ -258,9 +269,48 @@ the password out of committed files and shell scripts. Set
 `NOTIFICATIONS_ENABLED=0` if email should replace, rather than supplement, the
 local macOS notification.
 
+## Claude Code status-line bridge
+
+This is the recommended Claude live source. [Claude Code's status-line
+interface](https://code.claude.com/docs/en/statusline) passes 5-hour and 7-day
+quota percentages and reset times to status-line commands after the first API
+response in a session. The included collector writes only those four values
+plus a capture timestamp; it ignores session IDs, transcript paths, prompts,
+and credentials.
+
+Add this entry to `~/.claude/settings.json`, replacing both
+`/absolute/path/to/just-for-fun` placeholders with this repository's absolute
+path:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/absolute/path/to/just-for-fun/.venv/bin/python /absolute/path/to/just-for-fun/scripts/claude_quota_statusline.py"
+  }
+}
+```
+
+If a `statusLine` command already exists, preserve it and pipe a copy of its
+JSON input through the collector from that script instead of replacing it.
+After restarting Claude Code, run one turn so it emits a snapshot. Then start
+Quota Glass with:
+
+```bash
+ENABLE_CLAUDE_STATUSLINE=1 ./run.sh
+```
+
+The collector writes atomically with file mode `0600`. Missing, malformed, or
+old snapshots degrade to local estimates or visibly stale percentages; stale
+readings never alert. This path makes no provider request and never reads
+Keychain. It reflects usage observed by Claude Code, so usage from another
+Claude client appears after Claude Code's next API response.
+
 ## Claude OAuth opt-in: unsupported and fragile
 
-Live Claude quota percentages are **off by default**. If explicitly enabled,
+The legacy direct OAuth source remains available for compatibility but is not
+recommended. Live Claude quota percentages are **off by default**. If
+explicitly enabled,
 the backend caches successful usage responses in memory for at least five
 minutes by default. When a request is due, it re-reads the rotating Claude Code
 token from macOS Keychain immediately before calling:
@@ -319,8 +369,9 @@ does not have access to either provider's billing records.
 | --- | --- |
 | No local usage appears | Run a Codex or Claude Code turn, refresh the dashboard, and confirm `CODEX_SESSIONS_DIR` or `CLAUDE_PROJECTS_DIR` points at the client's actual data directory. |
 | ChatGPT is marked stale | Codex updates its local quota snapshot during turns. Run a new turn, or enable the live ChatGPT source. Stale readings intentionally do not alert. |
-| Claude shows estimates instead of percentages | This is expected in local mode: Claude Code records contain token usage, not subscription quota. Live percentages require the unsupported OAuth opt-in. |
-| A live source falls back to local data | Read the provider error shown on the dashboard. For ChatGPT, check that `codex` is installed, logged in, and reachable through `CODEX_CLI_PATH`. For Claude, the internal endpoint or Keychain item may have changed. |
+| Claude shows estimates instead of percentages | Confirm the status-line collector is configured, run a Claude Code turn, and check that `CLAUDE_STATUS_SNAPSHOT_PATH` is the same for Claude Code and Quota Glass. |
+| Claude percentages are stale | Claude Code refreshes the snapshot after API responses. Run a Claude Code turn; stale readings intentionally do not alert. |
+| A live source falls back to local data | Read the provider error shown on the dashboard. For ChatGPT, check that `codex` is installed, logged in, and reachable through `CODEX_CLI_PATH`. For the Claude status-line source, check the configured snapshot path. The legacy OAuth source may fail if the internal endpoint or Keychain item changes. |
 | `./run.sh` reports port 8000 in use | Quota Glass may already be running. Open the shown dashboard URL or stop the process identified by the script before restarting. |
 | Email configuration fails at startup | Set `EMAIL_TO`, `SMTP_HOST`, and either `EMAIL_FROM` or `SMTP_USERNAME`. Set `SMTP_USERNAME` and `SMTP_PASSWORD` together, or leave both empty for an unauthenticated relay. |
 

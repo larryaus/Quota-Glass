@@ -1,10 +1,9 @@
-"""
-Claude OAuth usage uses an undocumented internal endpoint.
+"""Claude local usage plus opt-in status-line and OAuth quota sources.
 
-It is off by default, may break on any Claude Code update, and must always
-degrade safely to local JSONL totals. The rotating Keychain token is re-read
-for every actual HTTP request and is never cached. Only successful usage
-response payloads are cached in memory.
+The status-line bridge reads Claude Code's documented local payload and is the
+preferred live source. The legacy OAuth path uses an undocumented internal
+endpoint, may break on any Claude Code update, and must always degrade safely
+to local JSONL totals.
 """
 
 import asyncio
@@ -26,6 +25,11 @@ from app.models import (
     LocalUsageWindow,
     Meter,
     ProviderState,
+)
+from app.providers.claude_statusline import (
+    ClaudeStatuslineSnapshot,
+    ClaudeStatuslineSnapshotError,
+    read_statusline_snapshot,
 )
 from app.providers.live_cache import LiveSourceCache
 from app.providers.usage import (
@@ -498,11 +502,71 @@ def _oauth_credits(data: Dict[str, Any]) -> Credits:
     )
 
 
+def _statusline_state(
+    snapshot: ClaudeStatuslineSnapshot,
+    local: ProviderState,
+    now: Optional[datetime] = None,
+) -> ProviderState:
+    current_epoch = int(_utc_datetime(now).timestamp())
+    reset_window_stale = False
+    meters = []
+    for key, value in snapshot.rate_limits.items():
+        label, minutes = OAUTH_WINDOWS[key]
+        resets_at = value.get("resets_at")
+        meter_stale = snapshot.stale or (
+            resets_at is not None and resets_at <= current_epoch
+        )
+        reset_window_stale = reset_window_stale or (
+            meter_stale and not snapshot.stale
+        )
+        meters.append(
+            Meter(
+                key="claude.%s" % key,
+                provider="claude",
+                label=label,
+                used_pct=value["used_percentage"],
+                window_minutes=minutes,
+                resets_at=resets_at,
+                has_quota=True,
+                source="statusline",
+                stale=meter_stale,
+            )
+        )
+
+    error = None
+    if snapshot.stale:
+        error = (
+            "Claude Code quota snapshot is %ds old; run a Claude Code turn "
+            "to refresh it. Stale readings never alert."
+            % snapshot.age_seconds
+        )
+    elif reset_window_stale:
+        error = (
+            "A Claude Code quota window has reset since the last observed "
+            "reading; run a Claude Code turn to refresh it. Stale readings "
+            "never alert."
+        )
+    return ProviderState(
+        key="claude",
+        label="Claude",
+        mode="statusline",
+        meters=meters,
+        plan_type="consumer",
+        error=error,
+        last_updated=_iso_datetime(snapshot.captured_at),
+        local_usage=local.local_usage,
+        model_usage=local.model_usage,
+    )
+
+
 async def parse_claude(
     projects_dir: Path,
     enable_oauth: bool = False,
     now: Optional[datetime] = None,
     oauth_cache: Optional[ClaudeOAuthCache] = None,
+    enable_statusline: bool = False,
+    statusline_snapshot_path: Optional[Path] = None,
+    statusline_stale_after_minutes: int = 30,
 ) -> ProviderState:
     try:
         local = await asyncio.to_thread(
@@ -518,7 +582,30 @@ async def parse_claude(
             plan_type="consumer",
             error="Claude local usage unavailable: %s" % exc,
         )
+    statusline_error = None
+    if enable_statusline:
+        if statusline_snapshot_path is None:
+            statusline_error = "no snapshot path was configured"
+        else:
+            try:
+                snapshot = await asyncio.to_thread(
+                    read_statusline_snapshot,
+                    statusline_snapshot_path,
+                    now,
+                    statusline_stale_after_minutes,
+                )
+                return _statusline_state(snapshot, local, now=now)
+            except ClaudeStatuslineSnapshotError as exc:
+                statusline_error = str(exc)
     if not enable_oauth:
+        if statusline_error is not None:
+            message = (
+                "Claude Code status-line quota unavailable; showing local "
+                "estimates: %s" % statusline_error
+            )
+            if local.error is not None:
+                message = "%s %s" % (message, local.error)
+            local.error = message
         return local
     current = _utc_datetime(now)
     cache = oauth_cache or ClaudeOAuthCache()
@@ -576,6 +663,11 @@ async def parse_claude(
         )
 
     reason = cache.backoff_reason or "No successful Claude OAuth response."
+    if statusline_error is not None:
+        reason = (
+            "Claude Code status-line snapshot unavailable: %s; %s"
+            % (statusline_error, reason)
+        )
     local.error = (
         "Claude OAuth unavailable; showing local estimates: %s "
         "Next attempt at %s."

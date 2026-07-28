@@ -99,6 +99,15 @@ class UsagePoller:
                         self.settings.claude_projects_dir,
                         self.settings.enable_claude_oauth,
                         oauth_cache=self._claude_oauth_cache,
+                        enable_statusline=(
+                            self.settings.enable_claude_statusline
+                        ),
+                        statusline_snapshot_path=(
+                            self.settings.claude_status_snapshot_path
+                        ),
+                        statusline_stale_after_minutes=(
+                            self.settings.claude_status_stale_after_minutes
+                        ),
                     )
                     polled_providers.append("claude")
                 except Exception as exc:
