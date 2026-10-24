@@ -35,47 +35,39 @@ required.
 
 ## Architecture
 
+Where readings come from:
+
+```mermaid
+flowchart LR
+    codexFiles["Codex sessions<br/>~/.codex/sessions"] --> poller
+    claudeFiles["Claude Code records<br/>~/.claude/projects"] --> poller
+    codexCli["codex app-server<br/>ENABLE_CHATGPT_LIVE"] -.-> poller
+    claudeStatus["Status-line snapshot<br/>ENABLE_CLAUDE_STATUSLINE"] -.-> poller
+    anthropic["api.anthropic.com<br/>+ Keychain token<br/>ENABLE_CLAUDE_OAUTH"] -.-> poller
+    poller["Poller"]
+```
+
+What the backend (127.0.0.1:8000) does with them:
+
 ```mermaid
 flowchart TB
-    subgraph onmac["On this Mac — always local"]
-        codexFiles["Codex session files<br/>~/.codex/sessions"]
-        claudeFiles["Claude Code records<br/>~/.claude/projects"]
-    end
-
-    subgraph optin["Opt-in — off by default"]
-        codexCli["codex app-server<br/>ENABLE_CHATGPT_LIVE"]
-        claudeStatus["Claude Code status-line snapshot<br/>ENABLE_CLAUDE_STATUSLINE"]
-        anthropic["api.anthropic.com<br/>ENABLE_CLAUDE_OAUTH"]
-        keychain["macOS Keychain<br/>token, per request only"]
-    end
-
-    subgraph backend["FastAPI backend — 127.0.0.1:8000"]
-        poller["UsagePoller<br/>every POLL_INTERVAL_SECONDS"]
-        burn["Burn rate<br/>projected exhaustion"]
-        alerts["AlertEngine<br/>EXHAUSTED / REFRESHED<br/>PROJECTED_EXHAUSTION"]
-        db[("SQLite<br/>data/usage.db")]
-    end
-
     ui["React dashboard<br/>localhost:5173"]
-    macos["macOS notification"]
-    email["SMTP email<br/>EMAIL_NOTIFICATIONS_ENABLED"]
+    poller["UsagePoller<br/>every<br/>POLL_INTERVAL_SECONDS"]
+    db[("SQLite<br/>data/usage.db")]
+    burn["Burn rate<br/>projected exhaustion"]
+    alerts["AlertEngine<br/>EXHAUSTED / REFRESHED<br/>PROJECTED_EXHAUSTION"]
+    macos["macOS<br/>notification"]
+    email["SMTP email<br/>opt-in"]
 
-    codexFiles --> poller
-    claudeFiles --> poller
-    codexCli -.-> poller
-    claudeStatus -.-> poller
-    keychain -.-> anthropic
-    anthropic -.-> poller
-
+    ui -->|/api/state| poller
+    ui -->|/api/history| db
+    poller -->|samples| db
     poller --> burn
     db -->|past samples| burn
     burn --> alerts
-    poller -->|samples| db
     alerts <-->|latch + events| db
     alerts --> macos
     alerts -.-> email
-    ui -->|"GET /api/state"| poller
-    ui -->|"GET /api/history"| db
 ```
 
 Solid arrows are always on and never leave the machine. Dashed arrows are the
