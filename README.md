@@ -37,38 +37,17 @@ required.
 
 Where readings come from:
 
-```mermaid
-flowchart LR
-    codexFiles["Codex sessions<br/>~/.codex/sessions"] --> poller
-    claudeFiles["Claude Code records<br/>~/.claude/projects"] --> poller
-    codexCli["codex app-server<br/>ENABLE_CHATGPT_LIVE"] -.-> poller
-    claudeStatus["Status-line snapshot<br/>ENABLE_CLAUDE_STATUSLINE"] -.-> poller
-    anthropic["api.anthropic.com<br/>+ Keychain token<br/>ENABLE_CLAUDE_OAUTH"] -.-> poller
-    poller["Poller"]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/sources-dark.png">
+  <img src="docs/diagrams/sources.png" width="470" alt="Five usage sources feed the poller: Codex session files and Claude Code records always; codex app-server, the Claude status-line snapshot and api.anthropic.com only when opted in.">
+</picture>
 
 What the backend (127.0.0.1:8000) does with them:
 
-```mermaid
-flowchart TB
-    ui["React dashboard<br/>localhost:5173"]
-    poller["UsagePoller<br/>every<br/>POLL_INTERVAL_SECONDS"]
-    db[("SQLite<br/>data/usage.db")]
-    burn["Burn rate<br/>projected exhaustion"]
-    alerts["AlertEngine<br/>EXHAUSTED / REFRESHED<br/>PROJECTED_EXHAUSTION"]
-    macos["macOS<br/>notification"]
-    email["SMTP email<br/>opt-in"]
-
-    ui -->|/api/state| poller
-    ui -->|/api/history| db
-    poller -->|samples| db
-    poller --> burn
-    db -->|past samples| burn
-    burn --> alerts
-    alerts <-->|latch + events| db
-    alerts --> macos
-    alerts -.-> email
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/backend-dark.png">
+  <img src="docs/diagrams/backend.png" width="470" alt="The poller writes samples to SQLite and feeds burn rate, which feeds AlertEngine; AlertEngine stores latches and events in SQLite and sends macOS notifications and optional SMTP email. The dashboard reads the poller and SQLite.">
+</picture>
 
 Solid arrows are always on and never leave the machine. Dashed arrows are the
 opt-in data paths. With every live source disabled, Quota Glass makes no
