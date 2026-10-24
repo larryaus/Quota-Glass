@@ -1,0 +1,18 @@
+flowchart TB
+    ui["React dashboard<br/>localhost:5173"]
+    poller["UsagePoller<br/>every<br/>POLL_INTERVAL_SECONDS"]
+    db[("SQLite<br/>data/usage.db")]
+    burn["Burn rate<br/>projected exhaustion"]
+    alerts["AlertEngine<br/>EXHAUSTED / REFRESHED<br/>PROJECTED_EXHAUSTION"]
+    macos["macOS<br/>notification"]
+    email["SMTP email<br/>opt-in"]
+
+    ui -->|/api/state| poller
+    ui -->|/api/history| db
+    poller -->|samples| db
+    poller --> burn
+    db -->|past samples| burn
+    burn --> alerts
+    alerts <-->|latch + events| db
+    alerts --> macos
+    alerts -.-> email

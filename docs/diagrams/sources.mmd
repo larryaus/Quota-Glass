@@ -1,0 +1,7 @@
+flowchart LR
+    codexFiles["Codex sessions<br/>~/.codex/sessions"] --> poller
+    claudeFiles["Claude Code records<br/>~/.claude/projects"] --> poller
+    codexCli["codex app-server<br/>ENABLE_CHATGPT_LIVE"] -.-> poller
+    claudeStatus["Status-line snapshot<br/>ENABLE_CLAUDE_STATUSLINE"] -.-> poller
+    anthropic["api.anthropic.com<br/>+ Keychain token<br/>ENABLE_CLAUDE_OAUTH"] -.-> poller
+    poller["Poller"]
